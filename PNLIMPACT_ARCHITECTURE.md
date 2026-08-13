@@ -255,52 +255,73 @@ Before any simulation or measurement, freeze the P&L state at **T-0** (day befor
 
 ```sql
 -- baseline/freeze_baseline.sql
--- Creates immutable snapshot of P&L by store/channel for the 90 days before change
+-- 52-week immutable P&L snapshot with seasonal decomposition
+-- Reason: 90-day window gives misleading baselines for Q4 holiday stores.
+-- A store measured Sep-Nov looks very different to one measured Nov-Jan.
+-- 52 weeks captures the full seasonal cycle cleanly.
 
 CREATE OR REPLACE TABLE US_FIN_ECOMM_DL_TABLES.PNL_IMPACT_BASELINE
 AS
+WITH weekly_actuals AS (
+    SELECT
+        @event_id                                AS event_id,
+        store_id,
+        channel_cd,
+        DATE_TRUNC(order_dt, WEEK)              AS week_dt,
+        DATE_DIFF(DATE_TRUNC(order_dt, WEEK),
+                  DATE_TRUNC(DATE_SUB(@effective_dt, INTERVAL 52 WEEK), WEEK),
+                  WEEK)                          AS week_num,   -- 0–51
+
+        SUM(gmv_amt)                             AS gmv,
+        SUM(net_sales_amt)                       AS net_revenue,
+        SUM(commission_amt)                      AS commission,
+        SUM(CASE WHEN event_nm = 'OMS_REFUND'   THEN chrg_amt ELSE 0 END) AS oms_refund,
+        SUM(CASE WHEN event_nm = 'RAP_REFUND'   THEN chrg_amt ELSE 0 END) AS rap_refund,
+        SUM(CASE WHEN event_nm = 'CB_REFUND'    THEN chrg_amt ELSE 0 END) AS cb_refund,
+        SUM(CASE WHEN event_nm = 'ADJUSTMENT'   THEN chrg_amt ELSE 0 END) AS adjustment,
+        COUNT(DISTINCT sales_order_num)          AS order_count,
+        SUM(gmv_amt) / NULLIF(COUNT(DISTINCT sales_order_num), 0) AS aov,
+        SUM(fulfillment_cost_amt)                AS fulfillment_cost,
+        SUM(net_sales_amt) - SUM(fulfillment_cost_amt) AS contribution_margin
+
+    FROM US_FIN_ECOMM_DL_TABLES.WM_SALES_ORDER_INV_CHRG_DTL chrg
+    JOIN US_FIN_ECOMM_DL_TABLES.CHANNEL_HIERARCHY_MASTER hier USING (store_id)
+    WHERE order_dt BETWEEN DATE_SUB(@effective_dt, INTERVAL 52 WEEK) AND @effective_dt
+      AND store_id = @store_id
+    GROUP BY 1, 2, 3, 4, 5
+),
+
+-- Seasonal index: each week's share of annual total
+-- Used to project "what does week N typically look like for this store?"
+seasonal_index AS (
+    SELECT
+        week_num,
+        gmv / NULLIF(SUM(gmv) OVER (), 0)              AS gmv_seasonal_idx,
+        contribution_margin / NULLIF(SUM(contribution_margin) OVER (), 0) AS cm_seasonal_idx,
+        order_count / NULLIF(SUM(order_count) OVER (), 0) AS volume_seasonal_idx
+    FROM weekly_actuals
+)
+
 SELECT
-    event_id,                        -- links back to ChangeEvent
-    store_id,
-    channel_cd,
-    DATE_TRUNC(order_dt, WEEK)       AS week_dt,
-
-    -- Revenue lines
-    SUM(gmv_amt)                     AS gmv,
-    SUM(net_sales_amt)               AS net_revenue,
-    SUM(commission_amt)              AS commission,
-
-    -- Refund lines (from WM_SALES_ORDER_INV_CHRG_DTL)
-    SUM(CASE WHEN event_nm = 'OMS_REFUND'  THEN chrg_amt ELSE 0 END) AS oms_refund,
-    SUM(CASE WHEN event_nm = 'RAP_REFUND'  THEN chrg_amt ELSE 0 END) AS rap_refund,
-    SUM(CASE WHEN event_nm = 'CB_REFUND'   THEN chrg_amt ELSE 0 END) AS cb_refund,
-    SUM(CASE WHEN event_nm = 'ADJUSTMENT'  THEN chrg_amt ELSE 0 END) AS adjustment,
-
-    -- Unit metrics
-    COUNT(DISTINCT sales_order_num)  AS order_count,
-    SUM(gmv_amt) / NULLIF(COUNT(DISTINCT sales_order_num), 0) AS aov,
-
-    -- Cost lines (from SAP GL)
-    SUM(fulfillment_cost_amt)        AS fulfillment_cost,
-
-    -- Derived
-    SUM(net_sales_amt) - SUM(fulfillment_cost_amt) AS contribution_margin,
-
-    CURRENT_TIMESTAMP()              AS baseline_frozen_ts
-
-FROM US_FIN_ECOMM_DL_TABLES.WM_SALES_ORDER_INV_CHRG_DTL chrg
-JOIN US_FIN_ECOMM_DL_TABLES.CHANNEL_HIERARCHY_MASTER hier
-    USING (store_id)
-WHERE order_dt BETWEEN DATE_SUB(@effective_dt, INTERVAL 90 DAY) AND @effective_dt
-  AND store_id = @store_id
-
-GROUP BY 1, 2, 3, 4
+    w.*,
+    s.gmv_seasonal_idx,
+    s.cm_seasonal_idx,
+    s.volume_seasonal_idx,
+    -- Annualised baseline (what does a "typical year" look like?)
+    SUM(w.gmv) OVER (PARTITION BY w.store_id)               AS annual_gmv_baseline,
+    SUM(w.contribution_margin) OVER (PARTITION BY w.store_id) AS annual_cm_baseline,
+    CURRENT_TIMESTAMP()                                      AS baseline_frozen_ts
+FROM weekly_actuals w
+JOIN seasonal_index s USING (week_num)
 ```
 
-**Why 90-day baseline?**
-- Captures full seasonality cycle (13 weeks)
-- Enough volume for statistical significance even for low-traffic stores
-- Aligns with Anaplan / MFP planning cycle used by Sam's Club finance
+**Why 52-week baseline with seasonal index?**
+- Holiday (Q4) spikes are 2–4× non-holiday weeks for eCommerce — a 90-day window that
+  includes Black Friday looks nothing like one that doesn't
+- Seasonal index (`volume_seasonal_idx`) is reused in the simulation: when projecting
+  post-launch P&L for week N, multiply the annual baseline by the seasonal index for
+  that calendar week — projection automatically inherits seasonality
+- For **new stores** (no 52-week history): use peer store seasonal index as proxy
 
 ---
 
@@ -348,13 +369,22 @@ def simulate_new_store_pnl(inputs: SimulationInputs, weeks: int = 13) -> Simulat
     for scenario_name, ramp in scenarios.items():
         weekly_pnl = []
         for week_idx, ramp_factor in enumerate(ramp[:weeks]):
+            # Use seasonal index so projections inherit the store's annual pattern.
+            # Week N post-launch maps to calendar week (effective_dt + week_idx).
+            # The seasonal index tells us that week's share of annual volume.
+            calendar_week_num = _calendar_week_offset(
+                inputs.change_event.effective_dt, week_idx
+            )
+            seasonal_idx = peer_baseline.volume_seasonal_idx[calendar_week_num]
+            seasonally_adjusted_volume = peer_baseline.annual_gmv_baseline * seasonal_idx
+
             projected = PnLWeek(
                 week=week_idx + 1,
-                gmv=peer_baseline.gmv * ramp_factor,
-                commission=peer_baseline.gmv * ramp_factor * inputs.commission_delta,
-                refund=peer_baseline.gmv * ramp_factor * inputs.refund_rate_assumption,
-                fulfillment_cost=peer_baseline.order_count * ramp_factor
-                                 * inputs.fulfillment_cost_assumption,
+                gmv=seasonally_adjusted_volume * ramp_factor,
+                commission=seasonally_adjusted_volume * ramp_factor * inputs.commission_delta,
+                refund=seasonally_adjusted_volume * ramp_factor * inputs.refund_rate_assumption,
+                fulfillment_cost=(seasonally_adjusted_volume / peer_baseline.aov)
+                                 * ramp_factor * inputs.fulfillment_cost_assumption,
             )
             projected.contribution_margin = (
                 projected.gmv
@@ -751,31 +781,31 @@ GET /api/v1/pnl-impact/accuracy?change_type=NEW_STORE
 
 ## 12. Implementation Roadmap
 
-| Phase | What | Deliverable | Duration |
-|-------|------|-------------|----------|
-| **P0** | Channel Hierarchy Master table + CDC detection | `CHANNEL_HIERARCHY_MASTER` BQ table, daily diff job | 1 week |
-| **P1** | Baseline freezer | `PNL_IMPACT_BASELINE` snapshot on change detect | 1 week |
-| **P2** | Reclassification simulation | Deterministic P&L delta for commission/cost changes | 2 weeks |
-| **P3** | New store simulation | Ramp curve model, peer-store proxy, 3-scenario output | 3 weeks |
-| **P4** | Actual impact measurement (DiD) | Post-launch DiD calculator, attribution breakdown | 3 weeks |
-| **P5** | Haiku narrative generation | Auto-generated plain-English summaries per event | 1 week |
-| **P6** | Analyst self-serve UI | Scenario input panel + waterfall chart (Streamlit or Looker) | 3 weeks |
-| **P7** | Exec dashboard | Looker Studio / BQ dashboard | 2 weeks |
-| **P8** | Simulation accuracy registry + calibration | Accuracy tracking, ramp curve learning | 2 weeks |
-| **P9** | Opus deviation analysis agent | Deep-dive for >20% simulation misses | 2 weeks |
+| Phase | What | Deliverable |
+|-------|------|-------------|
+| **P0** | CDC detection on existing `CHANNEL_HIERARCHY_MASTER` | Daily diff job + ChangeEvent emitter (table already exists in BQ ✅) |
+| **P1** | 52-week baseline freezer with seasonal index | `PNL_IMPACT_BASELINE` snapshot frozen on change detect |
+| **P2** | Reclassification simulation | Deterministic P&L delta for commission/cost changes |
+| **P3** | New store simulation | Ramp curve × seasonal index model, peer-store proxy, 3-scenario output |
+| **P4** | Actual impact measurement (DiD) | Post-launch DiD calculator, attribution decomposition |
+| **P5** | Haiku narrative generation | Auto-generated plain-English P&L impact summaries per event |
+| **P6** | Analyst self-serve UI | Scenario input panel + waterfall chart (Streamlit or Looker) |
+| **P7** | Exec dashboard | Looker Studio / BQ dashboard |
+| **P8** | Simulation accuracy registry + seasonal calibration | Accuracy tracking, ramp curve + seasonal index learning |
+| **P9** | Opus deviation analysis agent | Root-cause deep-dive for >20% simulation misses |
 
-**MVP (P0–P5): ~11 weeks** — simulation + measurement + AI narrative, no UI
-**Full system (P0–P9): ~20 weeks**
+**MVP (P0–P5):** CDC → baseline → simulation → measurement → AI narrative, no UI
+**Full system (P0–P9):** All above + self-serve UI + exec dashboard + calibration loop
 
 ---
 
 ## Open Questions (to confirm)
 
-1. **Is `CHANNEL_HIERARCHY_MASTER` an existing BQ table or does it need to be created?** If it already exists, CDC detection is faster to build.
+1. ~~**Is `CHANNEL_HIERARCHY_MASTER` an existing BQ table?**~~ ✅ **Confirmed: exists.** CDC detection is 1-week build.
 2. **What is the source of fulfillment cost at store level?** SAP GL via sub-ledger API, or something else?
-3. **Is the P&L simulation input to Anaplan?** If yes, the output format needs to match Anaplan import schema.
+3. ~~**Anaplan integration needed?**~~ ✅ **Confirmed: No.** Output goes to BQ + analyst UI + API only.
 4. **Who approves simulations before launch?** Finance VP? This determines the approval workflow UI.
-5. **Is the 90-day baseline window right?** For stores with high seasonality (holiday Q4), a 52-week baseline with seasonal decomposition may be more accurate.
+5. ~~**90-day or 52-week baseline?**~~ ✅ **Confirmed: 52-week with seasonal decomposition.** Seasonal index computed per store, peer store index used for new stores with no history.
 
 ---
 
