@@ -1,16 +1,16 @@
-# eCommerce P&L Impact Analysis & Simulation Architecture
+# eCommerce P&L Impact Analysis & Simulation — Architecture
 ### Channel Hierarchy Changes · New Store Onboarding · Walmart Finance Engineering
 
 > **Core question this system answers:**
 > *"When a channel hierarchy changes or a new store goes live — what is the P&L impact,
 > and how does it compare to what we predicted?"*
 
-> **Assumptions (correct if wrong):**
-> - Scope: Walmart.com eCommerce P&L (FDL_CoreFinance pipelines, OMS2, Plutus, BQ)
-> - P&L lines: GMV, commissions, refunds (OMS + RAP), adjustments, contribution margin
-> - Trigger: channel hierarchy change or new store_id in source data
-> - Workflow: auto-detect change → simulate impact → analyst reviews → measure actuals post-launch
-> - Users: Finance analysts (self-serve), Exec dashboards, downstream forecasting models
+> **Confirmed decisions:**
+> - `CHANNEL_HIERARCHY_MASTER` exists in BQ ✅
+> - No Anaplan integration needed ✅
+> - 52-week baseline with seasonal decomposition ✅
+> - Two-gate approval: Business then Engineering ✅
+> - Fulfillment cost source: TBD ⬜
 
 ---
 
@@ -18,17 +18,18 @@
 
 1. [What is a Channel Hierarchy Change?](#1-what-is-a-channel-hierarchy-change)
 2. [P&L Components in Scope](#2-pl-components-in-scope)
-3. [Overall Architecture](#3-overall-architecture)
-4. [Phase 1: Change Detection](#4-phase-1-change-detection)
-5. [Phase 2: Baseline Computation](#5-phase-2-baseline-computation)
-6. [Phase 3: Forward Simulation (Pre-launch)](#6-phase-3-forward-simulation-pre-launch)
-7. [Phase 4: Actual Impact Measurement (Post-launch)](#7-phase-4-actual-impact-measurement-post-launch)
-8. [Phase 5: Simulation vs Actual Reconciliation](#8-phase-5-simulation-vs-actual-reconciliation)
-9. [Data Model](#9-data-model)
-10. [Two-Gate Approval Workflow](#10-two-gate-approval-workflow)
-11. [AI Layer — LLM-Assisted Analysis](#11-ai-layer--llm-assisted-analysis)
-12. [Output Layer — Analyst & Exec Surfaces](#12-output-layer--analyst--exec-surfaces)
-13. [Implementation Roadmap](#13-implementation-roadmap)
+3. [System Overview](#3-system-overview)
+4. [Phase 1 — Change Detection](#4-phase-1--change-detection)
+5. [Phase 2 — Baseline Computation](#5-phase-2--baseline-computation)
+6. [Phase 3 — Forward Simulation (Pre-launch)](#6-phase-3--forward-simulation-pre-launch)
+7. [Phase 4 — Actual Impact Measurement (Post-launch)](#7-phase-4--actual-impact-measurement-post-launch)
+8. [Phase 5 — Simulation vs Actual Reconciliation](#8-phase-5--simulation-vs-actual-reconciliation)
+9. [Two-Gate Approval Workflow](#9-two-gate-approval-workflow)
+10. [AI Layer](#10-ai-layer)
+11. [Data Model & Schemas](#11-data-model--schemas)
+12. [Output Surfaces](#12-output-surfaces)
+13. [Implementation Phases](#13-implementation-phases)
+14. [Open Questions](#14-open-questions)
 
 ---
 
@@ -37,969 +38,714 @@
 In Walmart eCommerce, orders flow through a **channel hierarchy**:
 
 ```
-Business Unit (Walmart.com)
-  └── Channel (Marketplace / First-Party / SamsClub.com)
-        └── Fulfillment Type (1P / 3P / WFS / Club Pickup)
-              └── Store / Facility Node (store_id, club_nbr, FC_id)
+Business Unit  (Walmart.com)
+  └── Channel  (Marketplace / First-Party / WFS / Club)
+        └── Fulfillment Type  (1P / 3P / WFS / Club Pickup)
+              └── Store / Facility Node  (store_id, club_nbr, FC_id)
                     └── Seller / Category
 ```
 
 A **hierarchy change** is any mutation to this tree:
 
-| Change type | Example | P&L impact |
+| Change Type | Example | P&L Impact |
 |-------------|---------|-----------|
-| **New store node added** | New fulfillment center goes live (store_id=9876) | Orders shift from existing nodes → new cost/revenue attribution |
-| **Store reclassified** | FC re-typed from 1P→WFS | Commission rate changes, fulfillment cost bucket changes |
-| **Channel split** | Marketplace split into "Marketplace Ads" + "Marketplace Base" | Revenue lines bifurcate; historical comparisons break |
-| **Store merged / retired** | Two regional FCs consolidated | Orders reroute; P&L appears to "move" between nodes |
-| **New seller onboarded** | New 3P seller on marketplace | Commission + refund rate baseline doesn't exist yet |
+| **New store node** | New FC goes live (`store_id = 9876`) | Orders attribute to new node; volume, cost, commission land in a new bucket |
+| **Reclassification** | FC re-typed from `1P → WFS` | Commission rate changes; fulfillment cost bucket changes |
+| **Channel split** | Marketplace → `Marketplace Ads` + `Marketplace Base` | Revenue lines bifurcate; historical comparisons break |
+| **Store merged / retired** | Two regional FCs consolidated | Orders reroute; P&L appears to shift between nodes |
+| **New seller onboarded** | New 3P seller on marketplace | No refund rate or commission baseline exists yet |
 
-Each of these creates **two problems**:
-1. **Forward:** What will this do to P&L? (simulation before launch)
-2. **Backward:** After launch, how much of the P&L change is actually due to this, vs external factors?
+Each change creates **two problems**:
+1. **Forward (pre-launch):** What will this do to P&L? → Simulation
+2. **Backward (post-launch):** How much of the observed P&L change is actually due to this? → Causal measurement
 
 ---
 
 ## 2. P&L Components in Scope
 
-Based on existing FDL_CoreFinance pipeline tables:
+Built on top of existing FDL_CoreFinance pipeline tables:
 
 ```
 GROSS MERCHANDISE VALUE (GMV)
-  └── WM_SALES_ORDER_INV_CHRG_DTL  (charge detail per order line)
-  └── WM_SALES_ORDER_INV_TNDR_DTL  (tender / payment detail)
+  Source: WM_SALES_ORDER_INV_CHRG_DTL
 
 NET REVENUE
   = GMV
-  - OMS_REFUND   (refunds initiated via Order Management System)
-  - RAP_REFUND   (refunds via Returns & Adjustments Platform — physical return)
-  - CB_REFUND    (chargeback refunds)
-  - ADJUSTMENT   (price corrections, post-order adjustments)
+  − OMS_REFUND    (refunds via Order Management System)
+  − RAP_REFUND    (refunds via Returns & Adjustments Platform)
+  − CB_REFUND     (chargeback refunds)
+  − ADJUSTMENT    (post-order price corrections)
+  Source: WM_SALES_ORDER_INV_CHRG_DTL (event_nm dimension)
 
-COMMISSION / TAKE RATE  (Marketplace only)
-  = GMV × commission_rate(seller, category, channel)
+COMMISSION / TAKE RATE  [Marketplace only]
+  = GMV × commission_rate(channel, seller, category)
+  Source: CHANNEL_HIERARCHY_MASTER × WM_SALES_ORDER_INV_CHRG_DTL
 
 FULFILLMENT COST
-  = shipping_cost + warehouse_handling + last_mile_cost
-  (from SAP GL posting via sub-ledger API)
+  Source: TBD ⬜ (SAP GL via sub-ledger API or separate BQ table)
 
 CONTRIBUTION MARGIN (CM)
-  = Net Revenue - Fulfillment Cost - Seller Payouts - Promotions
+  = Net Revenue − Fulfillment Cost − Promotions
 
-UNIT ECONOMICS (per order)
-  = CM / order_count
+UNIT ECONOMICS
+  = CM ÷ order_count  (per-order profitability)
 ```
 
 ---
 
-## 3. Overall Architecture
+## 3. System Overview
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  DATA SOURCES                                                                 │
-│  OMS2 (orders) · Plutus/Kafka (real-time events) · SAP (GL/costs)            │
-│  ETL_LOAD_PARAMETERS (BQ) · WM_SALES_ORDER_INV_CHRG_DTL (BQ/Hudi)           │
-│  Channel Hierarchy Master (BQ reference table)                               │
-└─────────────────────────┬────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│  DATA SOURCES                                                            │
+│  CHANNEL_HIERARCHY_MASTER (BQ) · WM_SALES_ORDER_INV_CHRG_DTL (BQ/Hudi) │
+│  WM_SALES_ORDER_INV_TNDR_DTL · ETL_LOAD_PARAMETERS · SAP GL (cost)     │
+└───────────────────────────┬─────────────────────────────────────────────┘
+                            │
+                            ▼
+                  ┌──────────────────┐
+                  │  PHASE 1         │
+                  │  Change          │
+                  │  Detection       │  CDC on CHANNEL_HIERARCHY_MASTER
+                  │  (daily)         │  → emits ChangeEvent
+                  └────────┬─────────┘
+                           │
+              ┌────────────┴─────────────┐
+              │                          │
+              ▼                          ▼
+    ┌──────────────────┐      ┌──────────────────────┐
+    │  PHASE 2         │      │  PHASE 3              │
+    │  Baseline        │      │  Forward Simulation   │
+    │  Computation     │      │  (pre-launch)         │
+    │                  │      │                       │
+    │  52-week P&L     │      │  Ramp curve model     │
+    │  snapshot with   │      │  3 scenarios          │
+    │  seasonal index  │      │  (cons/base/opt)      │
+    └────────┬─────────┘      └──────────┬────────────┘
+             │                           │
+             └────────────┬──────────────┘
                           │
                           ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  PHASE 1: CHANGE DETECTION                                                    │
-│  CDC on Channel Hierarchy Master table (BQ audit log or Hudi timeline)       │
-│  Detects: new store_id, reclassification, channel split/merge                │
-│  Emits: ChangeEvent {change_type, affected_nodes, effective_date}            │
-└─────────────────────────┬────────────────────────────────────────────────────┘
-                          │
-             ┌────────────┴────────────┐
-             │                         │
-             ▼                         ▼
-┌─────────────────────┐   ┌──────────────────────────────────────────────────┐
-│  PHASE 2:           │   │  PHASE 3: FORWARD SIMULATION (pre-launch)         │
-│  BASELINE           │   │                                                   │
-│  COMPUTATION        │   │  Scenario Engine:                                 │
-│                     │   │  · Transfer baseline P&L to new node structure    │
-│  Freeze P&L         │   │  · Apply commission rate changes                  │
-│  snapshot at T-0    │   │  · Apply ramp curve (new store ≠ instant volume)  │
-│  before change      │   │  · Monte Carlo: low / base / high case            │
-│  goes live          │   │  · Output: simulated P&L delta by line item        │
-└─────────────────────┘   └──────────────────────────────────────────────────┘
-             │                         │
-             └────────────┬────────────┘
-                          │  [change goes live]
+              ┌───────────────────────┐
+              │  PHASE: APPROVAL      │
+              │  Gate 1 — Business    │  Signs off on P&L impact
+              │  Gate 2 — Engineering │  Signs off on pipeline impact
+              └───────────┬───────────┘
+                          │ Both approved
                           ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  PHASE 4: ACTUAL IMPACT MEASUREMENT (post-launch)                            │
-│  · Compare post-launch P&L to frozen T-0 baseline                            │
-│  · Isolate channel change signal from external noise (seasonality, GMV trend)│
-│  · Difference-in-Differences: treatment node vs control nodes                │
-│  · Attribution: how much of delta = channel change vs market movement?        │
-└─────────────────────────┬────────────────────────────────────────────────────┘
+                  [change goes live]
+                          │
+              ┌───────────┴───────────┐
+              │  PHASE 4              │
+              │  Actual Impact        │
+              │  Measurement          │
+              │                       │
+              │  Difference-in-Diff   │
+              │  Attribution by       │
+              │  volume / rate / cost │
+              └───────────┬───────────┘
                           │
                           ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  PHASE 5: SIMULATION vs ACTUAL RECONCILIATION                                 │
-│  · Did simulation predict the right direction and magnitude?                  │
-│  · Improve simulation assumptions for next change                             │
-│  · Store delta in accuracy registry → calibrate future simulations            │
-└─────────────────────────┬────────────────────────────────────────────────────┘
+              ┌───────────────────────┐
+              │  PHASE 5              │
+              │  Sim vs Actual        │
+              │  Reconciliation       │
+              │                       │
+              │  Accuracy registry    │
+              │  Calibrate future     │
+              │  simulations          │
+              └───────────┬───────────┘
                           │
                           ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  AI LAYER (Phase 2–5)                                                         │
-│  · LLM generates natural language narrative of P&L impact                    │
-│  · Anomaly detector flags unexpected post-launch deviations                  │
-│  · "Why did this happen?" agent traces deviation to root data change          │
-└──────────────────────────────────────────────────────────────────────────────┘
+              ┌───────────────────────┐
+              │  AI LAYER             │
+              │  Narrative (Haiku)    │
+              │  Deviation agent      │
+              │  (Opus if >20% miss)  │
+              └───────────┬───────────┘
                           │
-          ┌───────────────┼───────────────┐
-          ▼               ▼               ▼
-   Analyst Self-Serve  Exec Dashboard  Downstream API
-   (Scenario UI)       (BQ/Looker)     (Forecasting models)
+          ┌───────────────┼────────────────┐
+          ▼               ▼                ▼
+   Analyst Self-Serve  Exec Dashboard   API
+   (Scenario UI)       (BQ / Looker)    (Forecasting models)
 ```
 
 ---
 
-## 4. Phase 1: Change Detection
+## 4. Phase 1 — Change Detection
 
-The system needs to know *when* a hierarchy change happens — before a human tells it.
+**Trigger:** Daily scheduled job compares today's `CHANNEL_HIERARCHY_MASTER` to yesterday's snapshot.
 
-### Source of truth: Channel Hierarchy Master
+**Detected change types:**
 
-```sql
--- BQ table: US_FIN_ECOMM_DL_TABLES.CHANNEL_HIERARCHY_MASTER
--- Schema:
-CREATE TABLE IF NOT EXISTS CHANNEL_HIERARCHY_MASTER (
-    store_id          STRING,
-    store_nm          STRING,
-    channel_cd        STRING,   -- 'MARKETPLACE' | '1P' | 'WFS' | 'CLUB'
-    channel_nm        STRING,
-    fulfillment_type  STRING,
-    business_unit     STRING,
-    commission_rate   FLOAT64,
-    effective_dt      DATE,
-    expiry_dt         DATE,     -- NULL = currently active
-    record_hash       STRING,   -- SHA256 of key fields for CDC
-    created_ts        TIMESTAMP,
-    updated_ts        TIMESTAMP
-)
+| Signal | Detection Logic |
+|--------|----------------|
+| New store | `store_id` present in today, absent in yesterday |
+| Store retired | `store_id` absent in today, present in yesterday |
+| Reclassification | `store_id` present in both, but `channel_cd`, `fulfillment_type`, or `commission_rate` changed |
+| Channel split | New `channel_cd` values appear that didn't exist before |
+
+**Output:** A `ChangeEvent` record written to `PNL_IMPACT_EVENT` table (schema in §11).
+
+**Key design decision:** Change detection runs even on weekends. If a hierarchy change is applied on a Friday,
+the simulation and Gate 1 notification fires Saturday — analyst reviews Monday before the week's data loads.
+
+---
+
+## 5. Phase 2 — Baseline Computation
+
+**What:** Freeze an immutable 52-week P&L snapshot at T-0 (the last full day before the change effective date).
+
+**Why 52 weeks, not 90 days:**
+- eCommerce holiday (Q4) weeks are 2–4× non-holiday volume
+- A 90-day window containing Black Friday vs one that doesn't gives incomparable baselines
+- 52 weeks captures every seasonal pattern the store has ever exhibited
+
+**Seasonal index:** For each store, compute each calendar week's share of its annual GMV/CM.
+This index is used in Phase 3 to make simulations seasonally aware — a new store launching in October
+will be projected using October's seasonal multiplier, not a flat average.
+
+**For new stores (no 52-week history):** Use peer stores (similar channel, fulfillment type, geography)
+as the baseline proxy. Inherit peer store seasonal index.
+
+---
+
+## 6. Phase 3 — Forward Simulation (Pre-launch)
+
+Two simulation modes depending on change type:
+
+### Mode A: New Store
+No order history exists. Project from peer store baseline × ramp curve × seasonal index.
+
+```
+Projected GMV (week N) = Annual_peer_baseline × seasonal_index(week N) × ramp_factor(week N)
+
+Ramp curve: new stores don't instantly reach peer volume.
+  Week 1:  ~10% of peer volume
+  Week 4:  ~40%
+  Week 8:  ~70%
+  Week 13: ~85%
+  (analyst-adjustable via UI)
 ```
 
-### CDC (Change Data Capture) watcher
+Three scenarios output:
 
-```python
-# change_detection/hierarchy_watcher.py
-# Runs as daily Airflow task or triggered by BQ audit log Pub/Sub
+| Scenario | Ramp multiplier | Use |
+|----------|----------------|-----|
+| Conservative | 0.7× base ramp | Downside / risk case |
+| Base | Peer historical ramp | Planning case |
+| Optimistic | 1.3× base ramp (capped at 100%) | Upside case |
 
-def detect_hierarchy_changes(bq_client, run_date: date) -> List[ChangeEvent]:
-    """
-    Compare today's CHANNEL_HIERARCHY_MASTER to yesterday's snapshot.
-    Detect: new rows (new store), updated rows (reclassification), deleted rows (retirement).
-    """
-    query = """
-    WITH today AS (
-        SELECT store_id, channel_cd, fulfillment_type, commission_rate,
-               record_hash, effective_dt
-        FROM US_FIN_ECOMM_DL_TABLES.CHANNEL_HIERARCHY_MASTER
-        WHERE expiry_dt IS NULL  -- active records
-    ),
-    yesterday AS (
-        SELECT store_id, channel_cd, fulfillment_type, commission_rate,
-               record_hash
-        FROM US_FIN_ECOMM_DL_TABLES.CHANNEL_HIERARCHY_MASTER_SNAPSHOT
-        WHERE snapshot_dt = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
-    )
-    SELECT
-        COALESCE(t.store_id, y.store_id)  AS store_id,
-        CASE
-            WHEN y.store_id IS NULL         THEN 'NEW_STORE'
-            WHEN t.store_id IS NULL         THEN 'STORE_RETIRED'
-            WHEN t.record_hash != y.record_hash THEN 'RECLASSIFIED'
-        END AS change_type,
-        y.channel_cd    AS old_channel,
-        t.channel_cd    AS new_channel,
-        y.commission_rate AS old_commission_rate,
-        t.commission_rate AS new_commission_rate,
-        CURRENT_DATE() AS detected_dt
-    FROM today t
-    FULL OUTER JOIN yesterday y USING (store_id)
-    WHERE t.record_hash != y.record_hash
-       OR y.store_id IS NULL
-       OR t.store_id IS NULL
-    """
-    changes = bq_client.query(query).result()
-    return [ChangeEvent.from_row(row) for row in changes]
+### Mode B: Reclassification
+Order history exists. Apply new commission rate / cost structure to known volume.
+
+```
+CM delta (week N) = order_volume(week N) × (new_commission_rate − old_commission_rate) × AOV
+                  + order_volume(week N) × (old_cost_per_order − new_cost_per_order)
 ```
 
-### Change event schema
+No ramp curve needed — volume is known, rate change is instantaneous.
 
-```python
-@dataclass
-class ChangeEvent:
-    event_id:           str       # UUID
-    change_type:        str       # NEW_STORE | RECLASSIFIED | STORE_RETIRED | CHANNEL_SPLIT
-    store_id:           str
-    old_channel:        str       # None for NEW_STORE
-    new_channel:        str
-    old_commission_rate: float    # None for NEW_STORE
-    new_commission_rate: float
-    effective_dt:       date
-    detected_dt:        date
-    affected_order_volume_l90d: int   # lookback order count (0 for new store)
-    similar_past_events: List[str]    # event_ids of past similar changes (for simulation seeding)
+**Simulation output:** Weekly P&L projection for 13 weeks × 3 scenarios.
+Annualised CM impact, break-even week (for new stores), confidence range.
+
+---
+
+## 7. Phase 4 — Actual Impact Measurement (Post-launch)
+
+**Problem:** After launch, raw P&L comparison is misleading.
+If GMV is up 10% post-launch, is that because of the new store — or because it's peak season?
+
+**Solution: Difference-in-Differences (DiD)**
+
+```
+Causal P&L impact = (Treatment_post − Treatment_pre) − (Control_post − Control_pre)
+
+Treatment: the changed store(s)
+Control:   similar stores that did NOT change in the same period (peer stores)
+Pre:       T-52w to T-0 (same as baseline)
+Post:      T+1w to T+13w
+```
+
+DiD strips out market-wide trends (seasonality, macro, concurrent promotions)
+and isolates the signal attributable to the hierarchy change itself.
+
+**Attribution decomposition** breaks the total CM delta into root causes:
+
+```
+Total CM delta
+  = Volume effect         (did orders increase/decrease?)
+  + Commission effect     (did take rate change move revenue?)
+  + Refund rate effect    (did return rate change?)
+  + Cost effect           (did per-order cost change?)
+  + Residual              (interaction effects)
 ```
 
 ---
 
-## 5. Phase 2: Baseline Computation
+## 8. Phase 5 — Simulation vs Actual Reconciliation
 
-Before any simulation or measurement, freeze the P&L state at **T-0** (day before change effective date).
+After 13 weeks post-launch, compare what the simulation predicted to what actually happened.
 
-```sql
--- baseline/freeze_baseline.sql
--- 52-week immutable P&L snapshot with seasonal decomposition
--- Reason: 90-day window gives misleading baselines for Q4 holiday stores.
--- A store measured Sep-Nov looks very different to one measured Nov-Jan.
--- 52 weeks captures the full seasonal cycle cleanly.
+**Accuracy metrics tracked:**
 
-CREATE OR REPLACE TABLE US_FIN_ECOMM_DL_TABLES.PNL_IMPACT_BASELINE
-AS
-WITH weekly_actuals AS (
-    SELECT
-        @event_id                                AS event_id,
-        store_id,
-        channel_cd,
-        DATE_TRUNC(order_dt, WEEK)              AS week_dt,
-        DATE_DIFF(DATE_TRUNC(order_dt, WEEK),
-                  DATE_TRUNC(DATE_SUB(@effective_dt, INTERVAL 52 WEEK), WEEK),
-                  WEEK)                          AS week_num,   -- 0–51
+| Metric | Definition |
+|--------|-----------|
+| MAPE | Mean absolute % error: `|actual_CM − sim_base_CM| / sim_base_CM` |
+| Direction accuracy | Did simulation correctly predict positive vs negative CM impact? |
+| Within bounds | Was actual CM between conservative and optimistic scenarios? |
+| Ramp accuracy | How close was the actual weekly ramp to the projected ramp? |
 
-        SUM(gmv_amt)                             AS gmv,
-        SUM(net_sales_amt)                       AS net_revenue,
-        SUM(commission_amt)                      AS commission,
-        SUM(CASE WHEN event_nm = 'OMS_REFUND'   THEN chrg_amt ELSE 0 END) AS oms_refund,
-        SUM(CASE WHEN event_nm = 'RAP_REFUND'   THEN chrg_amt ELSE 0 END) AS rap_refund,
-        SUM(CASE WHEN event_nm = 'CB_REFUND'    THEN chrg_amt ELSE 0 END) AS cb_refund,
-        SUM(CASE WHEN event_nm = 'ADJUSTMENT'   THEN chrg_amt ELSE 0 END) AS adjustment,
-        COUNT(DISTINCT sales_order_num)          AS order_count,
-        SUM(gmv_amt) / NULLIF(COUNT(DISTINCT sales_order_num), 0) AS aov,
-        SUM(fulfillment_cost_amt)                AS fulfillment_cost,
-        SUM(net_sales_amt) - SUM(fulfillment_cost_amt) AS contribution_margin
-
-    FROM US_FIN_ECOMM_DL_TABLES.WM_SALES_ORDER_INV_CHRG_DTL chrg
-    JOIN US_FIN_ECOMM_DL_TABLES.CHANNEL_HIERARCHY_MASTER hier USING (store_id)
-    WHERE order_dt BETWEEN DATE_SUB(@effective_dt, INTERVAL 52 WEEK) AND @effective_dt
-      AND store_id = @store_id
-    GROUP BY 1, 2, 3, 4, 5
-),
-
--- Seasonal index: each week's share of annual total
--- Used to project "what does week N typically look like for this store?"
-seasonal_index AS (
-    SELECT
-        week_num,
-        gmv / NULLIF(SUM(gmv) OVER (), 0)              AS gmv_seasonal_idx,
-        contribution_margin / NULLIF(SUM(contribution_margin) OVER (), 0) AS cm_seasonal_idx,
-        order_count / NULLIF(SUM(order_count) OVER (), 0) AS volume_seasonal_idx
-    FROM weekly_actuals
-)
-
-SELECT
-    w.*,
-    s.gmv_seasonal_idx,
-    s.cm_seasonal_idx,
-    s.volume_seasonal_idx,
-    -- Annualised baseline (what does a "typical year" look like?)
-    SUM(w.gmv) OVER (PARTITION BY w.store_id)               AS annual_gmv_baseline,
-    SUM(w.contribution_margin) OVER (PARTITION BY w.store_id) AS annual_cm_baseline,
-    CURRENT_TIMESTAMP()                                      AS baseline_frozen_ts
-FROM weekly_actuals w
-JOIN seasonal_index s USING (week_num)
-```
-
-**Why 52-week baseline with seasonal index?**
-- Holiday (Q4) spikes are 2–4× non-holiday weeks for eCommerce — a 90-day window that
-  includes Black Friday looks nothing like one that doesn't
-- Seasonal index (`volume_seasonal_idx`) is reused in the simulation: when projecting
-  post-launch P&L for week N, multiply the annual baseline by the seasonal index for
-  that calendar week — projection automatically inherits seasonality
-- For **new stores** (no 52-week history): use peer store seasonal index as proxy
+**Output:** Written to `PNL_SIMULATION_ACCURACY` table (schema in §11).
+Aggregated accuracy by `change_type` feeds back into future simulations —
+ramp curve priors and refund rate assumptions are calibrated from real outcomes.
 
 ---
 
-## 6. Phase 3: Forward Simulation (Pre-launch)
+## 9. Two-Gate Approval Workflow
 
-The simulation answers: *"If this store goes live / this channel changes, what will the P&L look like?"*
-
-### Simulation engine inputs
-
-```python
-@dataclass
-class SimulationInputs:
-    change_event:       ChangeEvent
-    baseline:           PnLBaseline         # from Phase 2
-
-    # Scenario assumptions (analyst-configurable)
-    volume_ramp_curve:  List[float]         # e.g. [0.1, 0.3, 0.6, 0.85, 1.0] over 5 weeks
-    commission_delta:   float               # change in take rate (e.g. +0.005 = +0.5%)
-    refund_rate_assumption: float           # expected refund rate for new store (default: peer avg)
-    fulfillment_cost_assumption: float      # $/order for new node
-
-    # Comparable stores (for new store — no history exists)
-    peer_stores:        List[str]           # similar store_ids to use as proxy baseline
-```
-
-### Ramp curve model (new store)
-
-A new store does not instantly reach full volume. Model a ramp:
-
-```python
-def simulate_new_store_pnl(inputs: SimulationInputs, weeks: int = 13) -> SimulationResult:
-    """
-    Project weekly P&L for a new store based on peer store baseline + ramp curve.
-    Run 3 scenarios: base / optimistic / conservative.
-    """
-    peer_baseline = _get_peer_weekly_avg(inputs.peer_stores)
-
-    scenarios = {
-        'conservative': [r * 0.7 for r in inputs.volume_ramp_curve],
-        'base':         inputs.volume_ramp_curve,
-        'optimistic':   [min(r * 1.3, 1.0) for r in inputs.volume_ramp_curve],
-    }
-
-    results = {}
-    for scenario_name, ramp in scenarios.items():
-        weekly_pnl = []
-        for week_idx, ramp_factor in enumerate(ramp[:weeks]):
-            # Use seasonal index so projections inherit the store's annual pattern.
-            # Week N post-launch maps to calendar week (effective_dt + week_idx).
-            # The seasonal index tells us that week's share of annual volume.
-            calendar_week_num = _calendar_week_offset(
-                inputs.change_event.effective_dt, week_idx
-            )
-            seasonal_idx = peer_baseline.volume_seasonal_idx[calendar_week_num]
-            seasonally_adjusted_volume = peer_baseline.annual_gmv_baseline * seasonal_idx
-
-            projected = PnLWeek(
-                week=week_idx + 1,
-                gmv=seasonally_adjusted_volume * ramp_factor,
-                commission=seasonally_adjusted_volume * ramp_factor * inputs.commission_delta,
-                refund=seasonally_adjusted_volume * ramp_factor * inputs.refund_rate_assumption,
-                fulfillment_cost=(seasonally_adjusted_volume / peer_baseline.aov)
-                                 * ramp_factor * inputs.fulfillment_cost_assumption,
-            )
-            projected.contribution_margin = (
-                projected.gmv
-                - projected.refund
-                - projected.fulfillment_cost
-            )
-            weekly_pnl.append(projected)
-        results[scenario_name] = weekly_pnl
-
-    return SimulationResult(
-        event_id=inputs.change_event.event_id,
-        scenarios=results,
-        cumulative_13w_cm={k: sum(w.contribution_margin for w in v)
-                           for k, v in results.items()},
-        break_even_week=_find_breakeven(results['base']),
-    )
-```
-
-### Reclassification simulation
-
-For existing stores changing channel/commission:
-
-```python
-def simulate_reclassification(inputs: SimulationInputs, weeks: int = 13) -> SimulationResult:
-    """
-    Apply new commission rate and cost structure to existing baseline volume.
-    No ramp curve needed — volume is known.
-    """
-    baseline = inputs.baseline
-    delta_commission_rate = inputs.commission_delta
-
-    weekly_pnl = []
-    for week in baseline.weekly_data:
-        new_commission = week.gmv * (week.commission_rate + delta_commission_rate)
-        commission_impact = new_commission - week.commission   # positive = more revenue
-
-        projected = PnLWeek(
-            week=week.week_dt,
-            gmv=week.gmv,                     # volume unchanged (immediate reclassification)
-            commission=new_commission,
-            refund=week.refund,               # refund rate unchanged initially
-            fulfillment_cost=week.fulfillment_cost,
-            contribution_margin=week.contribution_margin + commission_impact,
-        )
-        weekly_pnl.append(projected)
-
-    annual_cm_impact = sum(w.contribution_margin - b.contribution_margin
-                          for w, b in zip(weekly_pnl, baseline.weekly_data)) * (52 / weeks)
-
-    return SimulationResult(
-        event_id=inputs.change_event.event_id,
-        scenarios={'base': weekly_pnl},
-        annualized_cm_impact=annual_cm_impact,
-    )
-```
-
----
-
-## 7. Phase 4: Actual Impact Measurement (Post-launch)
-
-After the change goes live, measure what **actually happened** — and separate the channel change signal from external noise (seasonality, macro trends, promotions running concurrently).
-
-### Difference-in-Differences (DiD)
-
-```
-P&L impact = (Treatment_post - Treatment_pre) - (Control_post - Control_pre)
-
-Treatment group: affected store(s) / channel
-Control group:   similar stores that did NOT change (peer stores from Phase 3)
-Pre period:      T-90d to T-0 (same as baseline)
-Post period:     T+1 to T+13w
-```
-
-```python
-def measure_actual_impact(event: ChangeEvent,
-                          baseline: PnLBaseline,
-                          post_launch_weeks: int = 13) -> ActualImpact:
-    """
-    Difference-in-Differences to isolate channel change signal.
-    """
-    post_launch_pnl = _query_actual_pnl(
-        store_id=event.store_id,
-        start_dt=event.effective_dt,
-        weeks=post_launch_weeks,
-    )
-
-    # Control group: peer stores that didn't change in same period
-    control_pre = _query_actual_pnl(
-        store_ids=event.peer_stores,
-        start_dt=baseline.start_dt,
-        weeks=13,
-    )
-    control_post = _query_actual_pnl(
-        store_ids=event.peer_stores,
-        start_dt=event.effective_dt,
-        weeks=post_launch_weeks,
-    )
-
-    # DiD calculation
-    treatment_delta = post_launch_pnl.contribution_margin - baseline.contribution_margin
-    control_delta = control_post.contribution_margin - control_pre.contribution_margin
-
-    causal_impact = treatment_delta - control_delta   # channel change, stripped of market noise
-
-    return ActualImpact(
-        event_id=event.event_id,
-        total_cm_delta=treatment_delta,
-        causal_cm_impact=causal_impact,
-        market_movement_cm=control_delta,           # how much was just the market
-        attribution_breakdown={
-            'volume_effect':       _volume_effect(baseline, post_launch_pnl),
-            'commission_effect':   _commission_effect(baseline, post_launch_pnl),
-            'refund_rate_effect':  _refund_effect(baseline, post_launch_pnl),
-            'cost_effect':         _cost_effect(baseline, post_launch_pnl),
-        }
-    )
-```
-
-### Attribution decomposition
-
-```
-Total CM delta = Volume effect + Commission effect + Refund rate effect + Cost effect
-
-Volume effect     = (actual_orders - baseline_orders) × baseline_cm_per_order
-Commission effect = actual_orders × (new_commission_rate - baseline_commission_rate) × aov
-Refund effect     = actual_orders × (new_refund_rate - baseline_refund_rate) × aov × (-1)
-Cost effect       = actual_orders × (new_cost_per_order - baseline_cost_per_order) × (-1)
-
-Check: sum of effects ≈ total CM delta (small residual = interaction effects)
-```
-
----
-
-## 8. Phase 5: Simulation vs Actual Reconciliation
-
-Close the loop: how accurate was the pre-launch simulation?
-
-```python
-@dataclass
-class SimAccuracyRecord:
-    event_id:               str
-    change_type:            str
-
-    # What simulation predicted
-    sim_base_cm_13w:        float
-    sim_conservative_cm_13w: float
-    sim_optimistic_cm_13w:  float
-
-    # What actually happened
-    actual_cm_13w:          float
-
-    # Accuracy metrics
-    mape:                   float    # mean absolute percentage error vs base case
-    direction_correct:      bool     # did simulation get positive/negative right?
-    actual_within_bounds:   bool     # actual between conservative and optimistic?
-
-    # Calibration: update peer store model assumptions
-    ramp_curve_actual:      List[float]  # actual weekly ramp achieved
-    refund_rate_actual:     float
-    error_drivers:          List[str]    # what caused the largest misses
-```
-
-```sql
--- Stored in BQ: US_FIN_ECOMM_DL_TABLES.PNL_SIMULATION_ACCURACY
--- Used to calibrate future simulations — improve ramp curves, refund rate priors
-
-SELECT
-    change_type,
-    AVG(mape)                                    AS avg_mape,
-    COUNTIF(direction_correct) / COUNT(*)        AS direction_accuracy,
-    COUNTIF(actual_within_bounds) / COUNT(*)     AS within_bounds_rate,
-    AVG(ramp_curve_actual[OFFSET(3)])            AS avg_week4_ramp   -- typical ramp at week 4
-FROM US_FIN_ECOMM_DL_TABLES.PNL_SIMULATION_ACCURACY
-GROUP BY change_type
-```
-
----
-
-## 9. Data Model
-
-### Central registry: `PNL_IMPACT_EVENT`
-
-```sql
--- Master table linking all phases for one change event
-CREATE TABLE US_FIN_ECOMM_DL_TABLES.PNL_IMPACT_EVENT (
-    event_id              STRING NOT NULL,
-    change_type           STRING,           -- NEW_STORE | RECLASSIFIED | RETIRED | SPLIT
-    store_id              STRING,
-    old_channel           STRING,
-    new_channel           STRING,
-    effective_dt          DATE,
-    detected_dt           DATE,
-
-    -- Phase status
-    baseline_frozen_ts    TIMESTAMP,
-    simulation_run_ts     TIMESTAMP,
-    impact_measured_ts    TIMESTAMP,
-    reconciliation_ts     TIMESTAMP,
-
-    -- Summary P&L impacts (for quick dashboard queries)
-    sim_base_cm_impact    FLOAT64,          -- simulated CM delta (base case)
-    actual_cm_impact      FLOAT64,          -- measured causal CM impact
-    sim_accuracy_pct      FLOAT64,          -- abs % error between sim and actual
-
-    -- Links
-    baseline_table_ref    STRING,           -- BQ table/partition for baseline snapshot
-    simulation_output_ref STRING,
-    actual_impact_ref     STRING,
-
-    analyst_approved      BOOL,             -- analyst signed off on simulation pre-launch
-    analyst_id            STRING,
-    approval_ts           TIMESTAMP
-)
-PRIMARY KEY (event_id) NOT ENFORCED
-```
-
-### Lineage
-
-```
-ChangeEvent (detected)
-    └── PnLBaseline (frozen T-0 snapshot, 90d)
-          ├── SimulationResult (forward projection, 3 scenarios)
-          │     └── analyst approval → change goes live
-          ├── ActualImpact (DiD measurement, post-launch)
-          └── SimAccuracyRecord (sim vs actual, feeds calibration)
-```
-
----
-
-## 10. Two-Gate Approval Workflow
-
-Before a channel hierarchy change goes live, two independent parties must approve.
-**Neither gate can be bypassed.** Change is blocked in the pipeline until both are signed off.
+No hierarchy change goes live without both gates cleared. Neither can be bypassed.
 
 ```
 Simulation complete
        │
        ▼
 ┌──────────────────────────────────────────────────────┐
-│  GATE 1: BUSINESS APPROVAL                            │
-│  Reviewer: Finance stakeholder / Business owner       │
-│  Question: "Is this P&L impact acceptable?"           │
-│                                                       │
-│  They see:                                            │
-│  · 3-scenario P&L waterfall (conservative/base/opt)  │
-│  · Annualised CM impact ($)                          │
-│  · Refund rate and volume assumptions                │
-│  · AI narrative summary (Haiku-generated)            │
+│  GATE 1 — BUSINESS APPROVAL                          │
+│  Who: Finance stakeholder / Business owner           │
+│  Question: Is this P&L impact acceptable?            │
+│                                                      │
+│  Sees:                                               │
+│  · 3-scenario P&L waterfall (13-week projection)    │
+│  · Annualised CM impact ($)                         │
+│  · Key assumptions (ramp, commission rate, refunds) │
+│  · AI-generated plain-English narrative             │
 └─────────────────┬────────────────────────────────────┘
                   │ APPROVED
                   ▼
 ┌──────────────────────────────────────────────────────┐
-│  GATE 2: ENGINEERING APPROVAL                         │
-│  Reviewer: Eng lead / Data engineering owner          │
-│  Question: "Does this change break anything in the    │
-│            eComm P&L pipeline or data model?"         │
-│                                                       │
-│  They see:                                            │
-│  · Downstream table impact report (which BQ tables,   │
-│    Hudi partitions, DAGs are affected by this         │
-│    store_id / channel_cd change)                      │
-│  · Historical data reclassification scope             │
-│    (how many rows change if existing orders           │
-│    are re-bucketed into the new channel?)             │
-│  · ETL_LOAD_PARAMETERS check (does new store_id       │
-│    exist in all upstream load configs?)              │
+│  GATE 2 — ENGINEERING APPROVAL                       │
+│  Who: Eng lead / Data engineering owner              │
+│  Question: Does this break anything in the           │
+│            eComm P&L pipeline or data model?         │
+│                                                      │
+│  Auto-generated impact report shows:                 │
+│  · Which BQ tables reference this store_id           │
+│  · How many historical rows reclassify               │
+│    (scope of data change if existing orders          │
+│     are re-bucketed into the new channel)            │
+│  · Which Airflow DAGs load this store's data         │
+│    (checked against ETL_LOAD_PARAMETERS)             │
+│  · Missing pipeline configs for new store_id         │
+│    (if store_id not in load configs → data           │
+│     will be silently dropped post-launch)            │
 └─────────────────┬────────────────────────────────────┘
                   │ APPROVED
                   ▼
-            Change goes live
-       (hierarchy update effective)
+         deployment_unblocked = TRUE
+         Concord / CI pipeline gate passes
+         Hierarchy change goes live
 ```
 
-### Approval schema (added to `PNL_IMPACT_EVENT`)
+**Approval mechanics:**
+- Both approvers receive email with Approve / Reject links
+- Gate 2 email only fires after Gate 1 is approved
+- Approval click → updates `PNL_IMPACT_EVENT` with approver ID + timestamp
+- Deployment pipeline checks `deployment_unblocked` flag as a hard gate before activating change
+
+**What the Engineering gate catches that's easy to miss:**
+A new `store_id` added to the hierarchy but absent from `ETL_LOAD_PARAMETERS`
+will silently drop all its orders — they exist in OMS2 but never flow into BQ.
+The eng impact report surfaces this before deployment, not after.
+
+---
+
+## 10. AI Layer
+
+AI activates at two points — cost-optimised by volume.
+
+### Narrative generation (every event — Claude Haiku)
+
+After simulation completes, Haiku auto-generates a 3-paragraph plain-English summary:
+1. What changed and when
+2. Projected P&L impact (range across scenarios)
+3. Key assumptions and risks
+
+This goes into the Gate 1 approval email so the business approver sees narrative, not raw numbers.
+
+### Deviation analysis (triggered — Claude Opus)
+
+Fires only when `|actual_CM − sim_base_CM| / sim_base_CM > 20%` — a significant miss.
+
+Opus traces the deviation to its root cause by querying order-level data:
+- Was the ramp curve wrong (volume came in different from peer proxy)?
+- Did refund rates spike unexpectedly?
+- Was there a concurrent event (promotion, competitor, GCP outage) that the simulation didn't model?
+- Does this suggest a systematic error in how we chose peer stores?
+
+Output: structured deviation report + updated simulation assumptions for next change of same type.
+
+### Model routing
+
+| Condition | Model | Trigger |
+|-----------|-------|---------|
+| Every change event (narrative) | Claude Haiku | Simulation complete |
+| >20% sim vs actual miss | Claude Opus | Phase 5 accuracy check |
+| Analyst asks "why?" question | Claude Haiku / Opus depending on complexity | On-demand |
+
+Internal Walmart knowledge (Confluence, internal Stack Overflow via `content_search`) is queried before
+any external source — internal pipeline context is more relevant than public documentation.
+
+---
+
+## 11. Data Model & Schemas
+
+### `PNL_IMPACT_EVENT` — master registry
 
 ```sql
--- Additional columns on PNL_IMPACT_EVENT for approval tracking
-ALTER TABLE US_FIN_ECOMM_DL_TABLES.PNL_IMPACT_EVENT ADD COLUMN IF NOT EXISTS
-    -- Gate 1: Business
-    biz_approved          BOOL,
-    biz_approver_id       STRING,
-    biz_approval_ts       TIMESTAMP,
-    biz_approval_notes    STRING,    -- optional comment from approver
-    biz_sim_scenario      STRING,    -- which scenario they approved ('base'/'conservative')
+CREATE TABLE US_FIN_ECOMM_DL_TABLES.PNL_IMPACT_EVENT (
 
-    -- Gate 2: Engineering
-    eng_approved          BOOL,
-    eng_approver_id       STRING,
-    eng_approval_ts       TIMESTAMP,
-    eng_approval_notes    STRING,
-    eng_pipeline_impact   JSON,      -- structured list of affected DAGs / BQ tables
+    -- Identity
+    event_id                STRING    NOT NULL,   -- UUID, primary key
+    change_type             STRING,               -- NEW_STORE | RECLASSIFIED | RETIRED | SPLIT
+    store_id                STRING,
+    old_channel_cd          STRING,               -- NULL for NEW_STORE
+    new_channel_cd          STRING,
+    old_commission_rate     FLOAT64,
+    new_commission_rate     FLOAT64,
+    effective_dt            DATE,                 -- when change goes live
+    detected_dt             DATE,                 -- when CDC detected the change
 
-    -- Combined gate status
-    deployment_unblocked  BOOL       -- TRUE only when both gates approved
-```
+    -- Phase status timestamps
+    baseline_frozen_ts      TIMESTAMP,
+    simulation_run_ts       TIMESTAMP,
+    impact_measured_ts      TIMESTAMP,            -- populated post-launch
+    reconciliation_ts       TIMESTAMP,            -- populated 13w post-launch
 
-### Engineering impact report (auto-generated at simulation time)
+    -- Business approval (Gate 1)
+    biz_approved            BOOL,
+    biz_approver_id         STRING,
+    biz_approval_ts         TIMESTAMP,
+    biz_approval_notes      STRING,
+    biz_sim_scenario        STRING,               -- which scenario approved ('base'|'conservative')
 
-```python
-# approval/eng_impact_report.py
+    -- Engineering approval (Gate 2)
+    eng_approved            BOOL,
+    eng_approver_id         STRING,
+    eng_approval_ts         TIMESTAMP,
+    eng_approval_notes      STRING,
+    eng_pipeline_risk_level STRING,               -- LOW | MEDIUM | HIGH
 
-def generate_eng_impact_report(event: ChangeEvent) -> EngImpactReport:
-    """
-    Auto-generated before Gate 2 review.
-    Answers: what in the pipeline is touched by this store_id / channel change?
-    """
+    -- Combined gate
+    deployment_unblocked    BOOL,                 -- TRUE only when both gates approved
 
-    # 1. Which BQ tables reference this store_id?
-    affected_tables = bq_client.query(f"""
-        SELECT table_name, COUNT(*) AS row_count
-        FROM `region-us`.INFORMATION_SCHEMA.TABLES t
-        WHERE table_name IN (
-            SELECT DISTINCT table_name
-            FROM `region-us`.INFORMATION_SCHEMA.COLUMN_FIELD_PATHS
-            WHERE field_path = 'store_id'
-        )
-        -- This is a metadata check — actual row counts from each table
-    """)
+    -- P&L summary (for dashboard queries — avoids joining all child tables)
+    sim_conservative_cm_13w FLOAT64,
+    sim_base_cm_13w         FLOAT64,
+    sim_optimistic_cm_13w   FLOAT64,
+    actual_cm_13w           FLOAT64,              -- populated post-launch
+    causal_cm_impact        FLOAT64,              -- DiD-adjusted actual impact
+    sim_accuracy_mape       FLOAT64,              -- populated post-reconciliation
 
-    # 2. How many historical rows change if we reclassify?
-    reclassification_scope = bq_client.query(f"""
-        SELECT COUNT(*) AS order_count,
-               SUM(gmv_amt) AS gmv_at_risk,
-               MIN(order_dt) AS earliest_order
-        FROM US_FIN_ECOMM_DL_TABLES.WM_SALES_ORDER_INV_CHRG_DTL
-        WHERE store_id = '{event.store_id}'
-          AND order_dt >= DATE_SUB(CURRENT_DATE(), INTERVAL 52 WEEK)
-    """) if event.change_type == 'RECLASSIFIED' else None
+    -- Metadata
+    business_owner_email    STRING,
+    eng_owner_email         STRING,
+    affected_order_vol_l52w INT64,                -- historical order volume (proxy for change magnitude)
+    peer_store_ids          ARRAY<STRING>         -- stores used as baseline proxy
 
-    # 3. Which Airflow DAGs load this store's data?
-    affected_dags = bq_client.query(f"""
-        SELECT DISTINCT load_nm, start_timestamp, end_timestamp
-        FROM US_FIN_ECOMM_DL_TABLES.ETL_LOAD_PARAMETERS
-        WHERE load_nm LIKE '%{event.store_id}%'
-           OR load_nm LIKE '%{event.old_channel}%'
-    """)
-
-    # 4. Does the new store_id exist in all upstream configs?
-    missing_configs = _check_store_in_load_params(event.store_id)
-
-    return EngImpactReport(
-        affected_bq_tables=list(affected_tables),
-        reclassification_scope=reclassification_scope,
-        affected_dags=list(affected_dags),
-        missing_pipeline_configs=missing_configs,  # ← Eng must fix these before approving
-        risk_level=_assess_risk(reclassification_scope, missing_configs),
-    )
-```
-
-### Approval notification flow
-
-```python
-# approval/notifier.py
-
-def notify_gate1_business(event: ChangeEvent, sim: SimulationResult):
-    """Email to business stakeholder after simulation completes."""
-    send_email(
-        to=[event.business_owner_email],
-        subject=f'[ACTION REQUIRED] P&L Simulation Ready: {event.change_type} — {event.store_id}',
-        html_content=GATE1_EMAIL_TEMPLATE.format(
-            store_id=event.store_id,
-            change_type=event.change_type,
-            sim_base_cm=sim.cumulative_13w_cm['base'],
-            sim_conservative_cm=sim.cumulative_13w_cm['conservative'],
-            sim_optimistic_cm=sim.cumulative_13w_cm['optimistic'],
-            ai_narrative=sim.narrative,
-            approve_url=f'{APPROVAL_BASE_URL}/approve/biz/{event.event_id}',
-            reject_url=f'{APPROVAL_BASE_URL}/reject/biz/{event.event_id}',
-        )
-    )
-
-def notify_gate2_engineering(event: ChangeEvent, eng_report: EngImpactReport):
-    """Email to eng lead after Gate 1 clears — only fires if Gate 1 approved."""
-    send_email(
-        to=[event.eng_owner_email],
-        subject=f'[ACTION REQUIRED] Pipeline Impact Review: {event.change_type} — {event.store_id}',
-        html_content=GATE2_EMAIL_TEMPLATE.format(
-            store_id=event.store_id,
-            affected_tables=eng_report.affected_bq_tables,
-            reclassification_rows=eng_report.reclassification_scope,
-            affected_dags=eng_report.affected_dags,
-            missing_configs=eng_report.missing_pipeline_configs,
-            risk_level=eng_report.risk_level,
-            approve_url=f'{APPROVAL_BASE_URL}/approve/eng/{event.event_id}',
-            reject_url=f'{APPROVAL_BASE_URL}/reject/eng/{event.event_id}',
-        )
-    )
-
-# Approval URLs trigger a lightweight Cloud Function that:
-# 1. Updates PNL_IMPACT_EVENT (sets approved=True, records approver + timestamp)
-# 2. If both gates approved: sets deployment_unblocked=True
-# 3. Sends confirmation to both approvers
-# 4. Notifies whoever owns the deployment to proceed
-```
-
-### Gate blocking in the deployment pipeline
-
-```python
-# Concord / CI pipeline check before hierarchy change goes live
-
-def pre_deployment_gate_check(event_id: str) -> bool:
-    """Called by deployment pipeline before activating hierarchy change."""
-    event = bq_client.query(f"""
-        SELECT biz_approved, eng_approved, deployment_unblocked
-        FROM US_FIN_ECOMM_DL_TABLES.PNL_IMPACT_EVENT
-        WHERE event_id = '{event_id}'
-    """).first()
-
-    if not event.biz_approved:
-        raise DeploymentBlocked(f'Gate 1 (Business) not approved for event {event_id}')
-    if not event.eng_approved:
-        raise DeploymentBlocked(f'Gate 2 (Engineering) not approved for event {event_id}')
-
-    return True   # both gates clear — deployment may proceed
+) PRIMARY KEY (event_id) NOT ENFORCED
 ```
 
 ---
 
-## 11. AI Layer — LLM-Assisted Analysis
+### `PNL_IMPACT_BASELINE` — 52-week frozen snapshot
 
-Human analysts should not have to read raw numbers to understand what happened. The AI layer generates:
+```sql
+CREATE TABLE US_FIN_ECOMM_DL_TABLES.PNL_IMPACT_BASELINE (
 
-### Narrative generation (Haiku — high volume, templated)
+    event_id                STRING    NOT NULL,   -- FK to PNL_IMPACT_EVENT
+    store_id                STRING,
+    channel_cd              STRING,
+    week_dt                 DATE,                 -- Monday of each week
+    week_num                INT64,                -- 0–51 (0 = 52 weeks before effective_dt)
 
-```python
-NARRATIVE_PROMPT = """
-You are a Finance Data Analyst at Walmart eCommerce.
+    -- Revenue
+    gmv                     FLOAT64,
+    net_revenue             FLOAT64,
+    commission              FLOAT64,
 
-A channel hierarchy change occurred:
-- Change type: {change_type}
-- Store: {store_id} ({store_nm})
-- Old channel: {old_channel} → New channel: {new_channel}
-- Effective date: {effective_dt}
+    -- Refunds (from WM_SALES_ORDER_INV_CHRG_DTL event_nm dimension)
+    oms_refund              FLOAT64,
+    rap_refund              FLOAT64,
+    cb_refund               FLOAT64,
+    adjustment              FLOAT64,
+    total_refund            FLOAT64,              -- sum of above
+    refund_rate             FLOAT64,              -- total_refund / gmv
 
-Simulation results (pre-launch prediction):
-{simulation_summary}
+    -- Volume
+    order_count             INT64,
+    aov                     FLOAT64,              -- average order value
 
-Actual impact (post-launch measurement, {weeks_post} weeks):
-{actual_impact_summary}
+    -- Cost (source TBD ⬜)
+    fulfillment_cost        FLOAT64,
 
-Attribution breakdown:
-{attribution_breakdown}
+    -- Derived
+    contribution_margin     FLOAT64,
+    cm_per_order            FLOAT64,
 
-Write a 3-paragraph executive summary:
-1. What changed and when
-2. What the financial impact has been (vs what we predicted)
-3. Key drivers and any recommended actions
+    -- Seasonal index for this store × calendar week
+    gmv_seasonal_idx        FLOAT64,              -- this week's share of annual GMV
+    cm_seasonal_idx         FLOAT64,
+    volume_seasonal_idx     FLOAT64,
 
-Use plain English. Include specific dollar amounts. Flag if actual deviated from simulation by >20%.
-"""
+    -- Annual totals (for projection math)
+    annual_gmv_baseline     FLOAT64,
+    annual_cm_baseline      FLOAT64,
 
-def generate_narrative(event: ChangeEvent, sim: SimulationResult,
-                       actual: ActualImpact) -> str:
-    response = llm.messages.create(
-        model='claude-haiku-4',   # Haiku — runs after every change, needs to be cheap
-        messages=[{'role': 'user', 'content': NARRATIVE_PROMPT.format(...)}],
-        max_tokens=600,
-    )
-    return response.content[0].text
-```
+    baseline_frozen_ts      TIMESTAMP,
+    is_peer_proxy           BOOL                  -- TRUE if this store used as peer for a new store
 
-### Anomaly detection + "Why?" agent (Opus — triggered only on large deviations)
-
-```python
-def analyze_deviation(event: ChangeEvent, sim: SimulationResult,
-                      actual: ActualImpact) -> DeviationAnalysis:
-    """
-    Fires when |actual_cm - sim_base_cm| / sim_base_cm > 0.20 (>20% miss).
-    Uses Opus to trace the deviation to root data changes.
-    """
-    deviation_pct = abs(actual.causal_cm_impact - sim.base_cm) / abs(sim.base_cm)
-
-    if deviation_pct < 0.20:
-        return None   # small miss — Haiku narrative is sufficient
-
-    # Large miss — investigate with Opus
-    deep_analysis = llm.messages.create(
-        model='claude-opus-4',
-        messages=[{
-            'role': 'user',
-            'content': DEEP_ANALYSIS_PROMPT.format(
-                change_event=event,
-                simulation=sim,
-                actual=actual,
-                refund_rate_delta=actual.attribution_breakdown['refund_rate_effect'],
-                volume_delta=actual.attribution_breakdown['volume_effect'],
-                comparable_events=_get_similar_past_events(event),
-            )
-        }],
-        max_tokens=2000,
-    )
-    return _parse_deviation_analysis(deep_analysis)
-```
-
-### Root cause query agent
-
-Analyst can ask: *"Why did the refund rate for store 9876 spike in week 3?"*
-
-```python
-TOOLS = [
-    {
-        "name": "query_bq",
-        "description": "Run a BigQuery SQL query and return results",
-        "input_schema": {"query": "string", "max_rows": "integer"},
-    },
-    {
-        "name": "get_order_details",
-        "description": "Get order-level detail for a store/date range",
-        "input_schema": {"store_id": "string", "start_dt": "string", "end_dt": "string"},
-    },
-    {
-        "name": "compare_to_peers",
-        "description": "Compare a metric for store_id vs peer stores",
-        "input_schema": {"store_id": "string", "metric": "string", "date_range": "string"},
-    }
-]
-
-# Analyst asks a natural language question → agent calls tools → gives grounded answer
+) PARTITION BY DATE_TRUNC(week_dt, MONTH)
+  CLUSTER BY event_id, store_id
 ```
 
 ---
 
-## 11. Output Layer — Analyst & Exec Surfaces
+### `PNL_SIMULATION_RESULT` — forward projection
+
+```sql
+CREATE TABLE US_FIN_ECOMM_DL_TABLES.PNL_SIMULATION_RESULT (
+
+    event_id                STRING    NOT NULL,
+    scenario                STRING,               -- 'conservative' | 'base' | 'optimistic'
+    week_num                INT64,                -- 1–13 (post-launch)
+    projected_week_dt       DATE,
+
+    -- Projected P&L
+    proj_gmv                FLOAT64,
+    proj_commission         FLOAT64,
+    proj_refund             FLOAT64,              -- uses refund_rate_assumption
+    proj_fulfillment_cost   FLOAT64,
+    proj_contribution_margin FLOAT64,
+    proj_order_count        INT64,
+
+    -- Assumptions used (for auditability)
+    ramp_factor             FLOAT64,              -- % of peer volume this week
+    seasonal_idx_applied    FLOAT64,
+    commission_rate_used    FLOAT64,
+    refund_rate_assumption  FLOAT64,
+    cost_per_order_assumption FLOAT64,
+
+    simulation_run_ts       TIMESTAMP
+
+) PARTITION BY DATE_TRUNC(projected_week_dt, MONTH)
+  CLUSTER BY event_id, scenario
+```
+
+---
+
+### `PNL_ACTUAL_IMPACT` — post-launch measurement
+
+```sql
+CREATE TABLE US_FIN_ECOMM_DL_TABLES.PNL_ACTUAL_IMPACT (
+
+    event_id                STRING    NOT NULL,
+    week_num                INT64,                -- 1–13 post-launch
+    actual_week_dt          DATE,
+
+    -- Actuals (treatment store)
+    actual_gmv              FLOAT64,
+    actual_commission       FLOAT64,
+    actual_refund           FLOAT64,
+    actual_refund_rate      FLOAT64,
+    actual_fulfillment_cost FLOAT64,
+    actual_cm               FLOAT64,
+    actual_order_count      INT64,
+
+    -- Control group (peer stores — same weeks)
+    control_gmv             FLOAT64,
+    control_cm              FLOAT64,
+
+    -- Difference-in-Differences
+    treatment_delta_cm      FLOAT64,              -- actual_CM − baseline_CM (treatment)
+    control_delta_cm        FLOAT64,              -- control_post_CM − control_pre_CM
+    causal_cm_impact        FLOAT64,              -- treatment_delta − control_delta
+
+    -- Attribution decomposition
+    volume_effect           FLOAT64,
+    commission_effect       FLOAT64,
+    refund_rate_effect      FLOAT64,
+    cost_effect             FLOAT64,
+    residual_effect         FLOAT64,              -- interaction / unexplained
+
+    measured_ts             TIMESTAMP
+
+) PARTITION BY DATE_TRUNC(actual_week_dt, MONTH)
+  CLUSTER BY event_id
+```
+
+---
+
+### `PNL_SIMULATION_ACCURACY` — reconciliation & calibration
+
+```sql
+CREATE TABLE US_FIN_ECOMM_DL_TABLES.PNL_SIMULATION_ACCURACY (
+
+    event_id                STRING    NOT NULL,
+    change_type             STRING,
+
+    -- Simulation predictions (base case)
+    sim_base_cm_13w         FLOAT64,
+    sim_conservative_cm_13w FLOAT64,
+    sim_optimistic_cm_13w   FLOAT64,
+
+    -- Actuals
+    actual_cm_13w           FLOAT64,
+    causal_cm_13w           FLOAT64,              -- DiD-adjusted
+
+    -- Accuracy metrics
+    mape                    FLOAT64,              -- |actual − sim_base| / |sim_base|
+    direction_correct       BOOL,                 -- sign of impact predicted correctly?
+    actual_within_bounds    BOOL,                 -- actual between conservative and optimistic?
+
+    -- Ramp accuracy (new store only)
+    ramp_actual_wk1         FLOAT64,              -- actual ramp achieved each week
+    ramp_actual_wk4         FLOAT64,
+    ramp_actual_wk8         FLOAT64,
+    ramp_actual_wk13        FLOAT64,
+    ramp_assumed_wk1        FLOAT64,              -- what simulation assumed
+    ramp_assumed_wk4        FLOAT64,
+    ramp_assumed_wk8        FLOAT64,
+    ramp_assumed_wk13       FLOAT64,
+
+    -- Refund rate accuracy
+    refund_rate_actual      FLOAT64,
+    refund_rate_assumed     FLOAT64,
+
+    -- Deviation analysis (Opus-generated, populated only if MAPE > 20%)
+    deviation_root_causes   ARRAY<STRING>,
+    model_adjustment_recommended BOOL,
+
+    reconciled_ts           TIMESTAMP
+
+) CLUSTER BY change_type
+```
+
+---
+
+### `CHANNEL_HIERARCHY_SNAPSHOT` — daily CDC snapshot (new)
+
+```sql
+-- Daily point-in-time snapshot of CHANNEL_HIERARCHY_MASTER for CDC diffing
+CREATE TABLE US_FIN_ECOMM_DL_TABLES.CHANNEL_HIERARCHY_SNAPSHOT (
+
+    snapshot_dt             DATE,
+    store_id                STRING,
+    store_nm                STRING,
+    channel_cd              STRING,
+    fulfillment_type        STRING,
+    commission_rate         FLOAT64,
+    effective_dt            DATE,
+    record_hash             STRING    -- SHA256 of (channel_cd, fulfillment_type, commission_rate)
+
+) PARTITION BY snapshot_dt
+  CLUSTER BY store_id
+-- Retained 90 days (change detection only needs yesterday vs today)
+```
+
+---
+
+## 12. Output Surfaces
 
 ### Analyst self-serve (Scenario UI)
 
 ```
-Input panel:
-  ┌─────────────────────────────────────────────────────┐
-  │ Change type: [NEW_STORE ▼]                          │
-  │ Store ID: [_______]                                  │
-  │ Effective date: [2026-09-01]                         │
-  │                                                      │
-  │ Volume ramp: [▓▓▓░░░░░░░░░░] (drag to adjust)       │
-  │ Commission rate: [0.12] → [0.15]                     │
-  │ Peer stores (proxy): [9101, 9202, 9303]              │
-  └─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│ INPUT PANEL                                                   │
+│ Change type: [NEW_STORE ▼]   Store ID: [_______]             │
+│ Effective date: [2026-09-01]                                  │
+│ Volume ramp: ████░░░░░░░░░  (adjustable slider)              │
+│ Commission rate: 12% → 15%   Refund rate assumption: [4.2%]  │
+│ Peer stores: [9101, 9202, 9303] (auto-suggested, editable)   │
+└──────────────────────────────────────────────────────────────┘
 
-Output: 3-scenario P&L waterfall chart (13-week projection)
-        Break-even week indicator
-        Annualized CM impact: $X.XM (conservative) to $X.XM (optimistic)
-        AI narrative: 3-paragraph plain-English summary
+OUTPUT
+  · 13-week P&L waterfall chart (3 scenarios overlaid)
+  · Break-even week indicator (new stores)
+  · Annualised CM impact: $X.XM (cons) — $X.XM (opt)
+  · AI narrative summary (plain English, 3 paragraphs)
+  · [Submit for Business Approval] button
 ```
 
-### Exec dashboard (BigQuery → Looker Studio)
+### Exec dashboard (BQ → Looker Studio)
 
 ```
 Page 1: Active Changes
-  - Table of all open change events (in simulation or post-launch phases)
-  - Traffic light: simulation prediction vs actual trajectory
+  Table: all open events with phase status and traffic-light indicator
+  (simulation vs actual trajectory for post-launch events)
 
 Page 2: P&L Impact Summary
-  - Total simulated CM impact across all active changes: $XXM
-  - Total measured causal CM impact YTD: $XXM
-  - Simulation accuracy score: XX% (MAPE)
+  KPIs: Total simulated CM impact ($), Total measured causal CM YTD ($)
+        Simulation accuracy score (MAPE %), # events auto-within-bounds
 
 Page 3: Drill-down per event
-  - Waterfall: attribution breakdown
-  - Simulation vs actual overlay chart
-  - AI narrative + anomaly flags
+  · Waterfall: attribution breakdown (volume / commission / refund / cost)
+  · Simulation vs actual overlay chart (13 weeks)
+  · AI narrative + anomaly flag (if >20% deviation)
+  · Approval status (Gate 1 ✅ / Gate 2 ✅ / Pending)
 ```
 
 ### Downstream API
 
-```python
-# FastAPI / Cloud Run endpoint — consumed by forecasting models
+```
+GET  /pnl-impact/{event_id}
+     → SimulationResult + ActualImpact + AccuracyRecord
 
-GET /api/v1/pnl-impact/{event_id}
-  → SimulationResult + ActualImpact + Accuracy
+GET  /pnl-impact/store/{store_id}/history
+     → All change events and outcomes for a store
 
-GET /api/v1/pnl-impact/store/{store_id}/history
-  → List of all change events + outcomes for a store
+POST /pnl-impact/simulate
+     Body: {change_type, store_id, effective_dt, assumptions}
+     → SimulationResult (synchronous)
 
-POST /api/v1/pnl-impact/simulate
-  Body: SimulationInputs
-  → SimulationResult (synchronous, <5s)
-
-GET /api/v1/pnl-impact/accuracy?change_type=NEW_STORE
-  → Aggregated simulation accuracy metrics (feeds forecast model calibration)
+GET  /pnl-impact/accuracy?change_type=NEW_STORE
+     → Aggregated accuracy metrics (calibration feed for forecasting models)
 ```
 
 ---
 
-## 12. Implementation Roadmap
+## 13. Implementation Phases
 
 | Phase | What | Deliverable |
 |-------|------|-------------|
-| **P0** | CDC detection on existing `CHANNEL_HIERARCHY_MASTER` | Daily diff job + ChangeEvent emitter (table already exists in BQ ✅) |
-| **P1** | 52-week baseline freezer with seasonal index | `PNL_IMPACT_BASELINE` snapshot frozen on change detect |
-| **P2** | Reclassification simulation | Deterministic P&L delta for commission/cost changes |
-| **P3** | New store simulation | Ramp curve × seasonal index model, peer-store proxy, 3-scenario output |
-| **P4** | Actual impact measurement (DiD) | Post-launch DiD calculator, attribution decomposition |
-| **P5** | Haiku narrative generation | Auto-generated plain-English P&L impact summaries per event |
-| **P6** | Analyst self-serve UI | Scenario input panel + waterfall chart (Streamlit or Looker) |
-| **P7** | Exec dashboard | Looker Studio / BQ dashboard |
-| **P8** | Simulation accuracy registry + seasonal calibration | Accuracy tracking, ramp curve + seasonal index learning |
-| **P9** | Opus deviation analysis agent | Root-cause deep-dive for >20% simulation misses |
+| **P0** | CDC detection on existing `CHANNEL_HIERARCHY_MASTER` | `CHANNEL_HIERARCHY_SNAPSHOT` table + daily diff job → ChangeEvent |
+| **P1** | 52-week baseline with seasonal index | `PNL_IMPACT_BASELINE` schema + freeze job on change detect |
+| **P2** | Reclassification simulation | `PNL_SIMULATION_RESULT` schema + Mode B (commission/cost delta) |
+| **P3** | New store simulation | Mode A (ramp curve × peer proxy × seasonal index), 3 scenarios |
+| **P4** | Two-gate approval workflow | Email notifications, approval tracking in `PNL_IMPACT_EVENT`, deployment gate check |
+| **P5** | Actual impact measurement (DiD) | `PNL_ACTUAL_IMPACT` schema + weekly attribution computation |
+| **P6** | Haiku narrative generation | Plain-English summaries for Gate 1 email and analyst UI |
+| **P7** | Analyst self-serve UI | Scenario input panel + waterfall chart |
+| **P8** | Exec dashboard | Looker Studio / BQ dashboard (3 pages above) |
+| **P9** | Sim vs actual reconciliation | `PNL_SIMULATION_ACCURACY` schema + calibration of ramp / refund priors |
+| **P10** | Opus deviation analysis | Root-cause agent for >20% simulation misses |
 
-**MVP (P0–P5):** CDC → baseline → simulation → measurement → AI narrative, no UI
-**Full system (P0–P9):** All above + self-serve UI + exec dashboard + calibration loop
-
----
-
-## Open Questions (to confirm)
-
-1. ~~**Is `CHANNEL_HIERARCHY_MASTER` an existing BQ table?**~~ ✅ **Confirmed: exists.** CDC detection is 1-week build.
-2. **What is the source of fulfillment cost at store level?** SAP GL via sub-ledger API, or something else?
-3. ~~**Anaplan integration needed?**~~ ✅ **Confirmed: No.** Output goes to BQ + analyst UI + API only.
-4. ~~**Who approves simulations before launch?**~~ ✅ **Confirmed: Two-gate approval.**
-   - **Gate 1 — Business:** Finance stakeholder approves projected P&L impact
-   - **Gate 2 — Engineering:** Eng lead confirms no unintended impact on overall eComm P&L pipeline
-5. ~~**90-day or 52-week baseline?**~~ ✅ **Confirmed: 52-week with seasonal decomposition.** Seasonal index computed per store, peer store index used for new stores with no history.
+**MVP (P0–P6):** Change detection → baseline → simulation → approval gates → measurement → AI narrative
+**Full system (P0–P10):** All above + self-serve UI + exec dashboard + calibration loop
 
 ---
 
-*Designed for Walmart Finance Engineering — GCP BigQuery, Airflow (FDL), OMS2, Plutus/Kafka*
-*AI: Claude Haiku 4 (narrative, high-volume), Claude Opus 4 (deviation analysis, triggered)*
+## 14. Open Questions
+
+| # | Question | Status |
+|---|----------|--------|
+| 1 | Does `CHANNEL_HIERARCHY_MASTER` exist in BQ? | ✅ Yes |
+| 2 | **Fulfillment cost source — which BQ table or API?** | ⬜ TBD |
+| 3 | Anaplan integration needed? | ✅ No |
+| 4 | Two-gate approval: Business + Engineering | ✅ Confirmed |
+| 5 | Baseline window | ✅ 52-week with seasonal decomposition |
+
+---
+
+*Data sources: GCP BigQuery · Airflow (FDL_CoreFinance) · OMS2 · Plutus/Kafka · SAP GL*
+*AI: Claude Haiku 4 (narrative) · Claude Opus 4 (deviation analysis, triggered only)*
