@@ -25,9 +25,10 @@
 7. [Phase 4: Actual Impact Measurement (Post-launch)](#7-phase-4-actual-impact-measurement-post-launch)
 8. [Phase 5: Simulation vs Actual Reconciliation](#8-phase-5-simulation-vs-actual-reconciliation)
 9. [Data Model](#9-data-model)
-10. [AI Layer — LLM-Assisted Analysis](#10-ai-layer--llm-assisted-analysis)
-11. [Output Layer — Analyst & Exec Surfaces](#11-output-layer--analyst--exec-surfaces)
-12. [Implementation Roadmap](#12-implementation-roadmap)
+10. [Two-Gate Approval Workflow](#10-two-gate-approval-workflow)
+11. [AI Layer — LLM-Assisted Analysis](#11-ai-layer--llm-assisted-analysis)
+12. [Output Layer — Analyst & Exec Surfaces](#12-output-layer--analyst--exec-surfaces)
+13. [Implementation Roadmap](#13-implementation-roadmap)
 
 ---
 
@@ -614,7 +615,196 @@ ChangeEvent (detected)
 
 ---
 
-## 10. AI Layer — LLM-Assisted Analysis
+## 10. Two-Gate Approval Workflow
+
+Before a channel hierarchy change goes live, two independent parties must approve.
+**Neither gate can be bypassed.** Change is blocked in the pipeline until both are signed off.
+
+```
+Simulation complete
+       │
+       ▼
+┌──────────────────────────────────────────────────────┐
+│  GATE 1: BUSINESS APPROVAL                            │
+│  Reviewer: Finance stakeholder / Business owner       │
+│  Question: "Is this P&L impact acceptable?"           │
+│                                                       │
+│  They see:                                            │
+│  · 3-scenario P&L waterfall (conservative/base/opt)  │
+│  · Annualised CM impact ($)                          │
+│  · Refund rate and volume assumptions                │
+│  · AI narrative summary (Haiku-generated)            │
+└─────────────────┬────────────────────────────────────┘
+                  │ APPROVED
+                  ▼
+┌──────────────────────────────────────────────────────┐
+│  GATE 2: ENGINEERING APPROVAL                         │
+│  Reviewer: Eng lead / Data engineering owner          │
+│  Question: "Does this change break anything in the    │
+│            eComm P&L pipeline or data model?"         │
+│                                                       │
+│  They see:                                            │
+│  · Downstream table impact report (which BQ tables,   │
+│    Hudi partitions, DAGs are affected by this         │
+│    store_id / channel_cd change)                      │
+│  · Historical data reclassification scope             │
+│    (how many rows change if existing orders           │
+│    are re-bucketed into the new channel?)             │
+│  · ETL_LOAD_PARAMETERS check (does new store_id       │
+│    exist in all upstream load configs?)              │
+└─────────────────┬────────────────────────────────────┘
+                  │ APPROVED
+                  ▼
+            Change goes live
+       (hierarchy update effective)
+```
+
+### Approval schema (added to `PNL_IMPACT_EVENT`)
+
+```sql
+-- Additional columns on PNL_IMPACT_EVENT for approval tracking
+ALTER TABLE US_FIN_ECOMM_DL_TABLES.PNL_IMPACT_EVENT ADD COLUMN IF NOT EXISTS
+    -- Gate 1: Business
+    biz_approved          BOOL,
+    biz_approver_id       STRING,
+    biz_approval_ts       TIMESTAMP,
+    biz_approval_notes    STRING,    -- optional comment from approver
+    biz_sim_scenario      STRING,    -- which scenario they approved ('base'/'conservative')
+
+    -- Gate 2: Engineering
+    eng_approved          BOOL,
+    eng_approver_id       STRING,
+    eng_approval_ts       TIMESTAMP,
+    eng_approval_notes    STRING,
+    eng_pipeline_impact   JSON,      -- structured list of affected DAGs / BQ tables
+
+    -- Combined gate status
+    deployment_unblocked  BOOL       -- TRUE only when both gates approved
+```
+
+### Engineering impact report (auto-generated at simulation time)
+
+```python
+# approval/eng_impact_report.py
+
+def generate_eng_impact_report(event: ChangeEvent) -> EngImpactReport:
+    """
+    Auto-generated before Gate 2 review.
+    Answers: what in the pipeline is touched by this store_id / channel change?
+    """
+
+    # 1. Which BQ tables reference this store_id?
+    affected_tables = bq_client.query(f"""
+        SELECT table_name, COUNT(*) AS row_count
+        FROM `region-us`.INFORMATION_SCHEMA.TABLES t
+        WHERE table_name IN (
+            SELECT DISTINCT table_name
+            FROM `region-us`.INFORMATION_SCHEMA.COLUMN_FIELD_PATHS
+            WHERE field_path = 'store_id'
+        )
+        -- This is a metadata check — actual row counts from each table
+    """)
+
+    # 2. How many historical rows change if we reclassify?
+    reclassification_scope = bq_client.query(f"""
+        SELECT COUNT(*) AS order_count,
+               SUM(gmv_amt) AS gmv_at_risk,
+               MIN(order_dt) AS earliest_order
+        FROM US_FIN_ECOMM_DL_TABLES.WM_SALES_ORDER_INV_CHRG_DTL
+        WHERE store_id = '{event.store_id}'
+          AND order_dt >= DATE_SUB(CURRENT_DATE(), INTERVAL 52 WEEK)
+    """) if event.change_type == 'RECLASSIFIED' else None
+
+    # 3. Which Airflow DAGs load this store's data?
+    affected_dags = bq_client.query(f"""
+        SELECT DISTINCT load_nm, start_timestamp, end_timestamp
+        FROM US_FIN_ECOMM_DL_TABLES.ETL_LOAD_PARAMETERS
+        WHERE load_nm LIKE '%{event.store_id}%'
+           OR load_nm LIKE '%{event.old_channel}%'
+    """)
+
+    # 4. Does the new store_id exist in all upstream configs?
+    missing_configs = _check_store_in_load_params(event.store_id)
+
+    return EngImpactReport(
+        affected_bq_tables=list(affected_tables),
+        reclassification_scope=reclassification_scope,
+        affected_dags=list(affected_dags),
+        missing_pipeline_configs=missing_configs,  # ← Eng must fix these before approving
+        risk_level=_assess_risk(reclassification_scope, missing_configs),
+    )
+```
+
+### Approval notification flow
+
+```python
+# approval/notifier.py
+
+def notify_gate1_business(event: ChangeEvent, sim: SimulationResult):
+    """Email to business stakeholder after simulation completes."""
+    send_email(
+        to=[event.business_owner_email],
+        subject=f'[ACTION REQUIRED] P&L Simulation Ready: {event.change_type} — {event.store_id}',
+        html_content=GATE1_EMAIL_TEMPLATE.format(
+            store_id=event.store_id,
+            change_type=event.change_type,
+            sim_base_cm=sim.cumulative_13w_cm['base'],
+            sim_conservative_cm=sim.cumulative_13w_cm['conservative'],
+            sim_optimistic_cm=sim.cumulative_13w_cm['optimistic'],
+            ai_narrative=sim.narrative,
+            approve_url=f'{APPROVAL_BASE_URL}/approve/biz/{event.event_id}',
+            reject_url=f'{APPROVAL_BASE_URL}/reject/biz/{event.event_id}',
+        )
+    )
+
+def notify_gate2_engineering(event: ChangeEvent, eng_report: EngImpactReport):
+    """Email to eng lead after Gate 1 clears — only fires if Gate 1 approved."""
+    send_email(
+        to=[event.eng_owner_email],
+        subject=f'[ACTION REQUIRED] Pipeline Impact Review: {event.change_type} — {event.store_id}',
+        html_content=GATE2_EMAIL_TEMPLATE.format(
+            store_id=event.store_id,
+            affected_tables=eng_report.affected_bq_tables,
+            reclassification_rows=eng_report.reclassification_scope,
+            affected_dags=eng_report.affected_dags,
+            missing_configs=eng_report.missing_pipeline_configs,
+            risk_level=eng_report.risk_level,
+            approve_url=f'{APPROVAL_BASE_URL}/approve/eng/{event.event_id}',
+            reject_url=f'{APPROVAL_BASE_URL}/reject/eng/{event.event_id}',
+        )
+    )
+
+# Approval URLs trigger a lightweight Cloud Function that:
+# 1. Updates PNL_IMPACT_EVENT (sets approved=True, records approver + timestamp)
+# 2. If both gates approved: sets deployment_unblocked=True
+# 3. Sends confirmation to both approvers
+# 4. Notifies whoever owns the deployment to proceed
+```
+
+### Gate blocking in the deployment pipeline
+
+```python
+# Concord / CI pipeline check before hierarchy change goes live
+
+def pre_deployment_gate_check(event_id: str) -> bool:
+    """Called by deployment pipeline before activating hierarchy change."""
+    event = bq_client.query(f"""
+        SELECT biz_approved, eng_approved, deployment_unblocked
+        FROM US_FIN_ECOMM_DL_TABLES.PNL_IMPACT_EVENT
+        WHERE event_id = '{event_id}'
+    """).first()
+
+    if not event.biz_approved:
+        raise DeploymentBlocked(f'Gate 1 (Business) not approved for event {event_id}')
+    if not event.eng_approved:
+        raise DeploymentBlocked(f'Gate 2 (Engineering) not approved for event {event_id}')
+
+    return True   # both gates clear — deployment may proceed
+```
+
+---
+
+## 11. AI Layer — LLM-Assisted Analysis
 
 Human analysts should not have to read raw numbers to understand what happened. The AI layer generates:
 
@@ -804,7 +994,9 @@ GET /api/v1/pnl-impact/accuracy?change_type=NEW_STORE
 1. ~~**Is `CHANNEL_HIERARCHY_MASTER` an existing BQ table?**~~ ✅ **Confirmed: exists.** CDC detection is 1-week build.
 2. **What is the source of fulfillment cost at store level?** SAP GL via sub-ledger API, or something else?
 3. ~~**Anaplan integration needed?**~~ ✅ **Confirmed: No.** Output goes to BQ + analyst UI + API only.
-4. **Who approves simulations before launch?** Finance VP? This determines the approval workflow UI.
+4. ~~**Who approves simulations before launch?**~~ ✅ **Confirmed: Two-gate approval.**
+   - **Gate 1 — Business:** Finance stakeholder approves projected P&L impact
+   - **Gate 2 — Engineering:** Eng lead confirms no unintended impact on overall eComm P&L pipeline
 5. ~~**90-day or 52-week baseline?**~~ ✅ **Confirmed: 52-week with seasonal decomposition.** Seasonal index computed per store, peer store index used for new stores with no history.
 
 ---
