@@ -59,10 +59,20 @@ Every pipeline failure maps to one of 9 buckets. The bucket determines the **res
                                │  {dag_id, task_id, run_id, error_msg, log_url}
                                ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│  LAYER 5 — Log Parser + XGBoost Classifier                                   │
-│  • Pull full logs from GCS/Stackdriver                                        │
-│  • Extract 50+ structured features (error_type, exit_code, keywords, etc.)   │
-│  • XGBoost classifies into R1–R9 bucket  (<100ms, no LLM cost)               │
+│  LOG PRE-PROCESSOR  (Stage 1 — always runs, <1 sec, zero LLM cost)           │
+│  • Pull full logs from GCS/Stackdriver  (100K+ lines raw)                    │
+│  • Regex extracts: critical error section, file candidates, line numbers,    │
+│    stack trace, last meaningful exception — reduces to 2–5K chars            │
+│  • Raw logs are NEVER sent to LLM or classifier — only the extracted section │
+│  • Output: {error_section, file_candidates, line_numbers, log_extract}       │
+└──────────────────────────────────────────────────────────────────────────────┘
+                               │  2–5K chars (not 100K)
+                               ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  LAYER 5 — ML Classifier (Stage 2)                                            │
+│  • Extract 50+ structured features from compressed log_extract               │
+│  • v0: Regex rules classify R1–R9 bucket (<1 sec, $0)                        │
+│  • v1: XGBoost classifies R1–R9 bucket  (<100ms, no LLM cost)               │
 │  • Output: {bucket, confidence_score, extracted_features}                    │
 └──────────────────────────────────────────────────────────────────────────────┘
                                │
@@ -186,6 +196,29 @@ Detects zombie runs (age > 6h) → marks failed → unblocks `max_active_runs: 1
 
 ## 4. Layer 5: ML Classifier
 
+### Stage 1 — Log Pre-Processor (always runs first, before any classifier or LLM)
+
+Raw Airflow/Dataproc logs are 100K+ lines. Sending them raw to an LLM or classifier is:
+- **Slow** — LLM context windows fill up, latency spikes
+- **Expensive** — tokens cost money; 100K lines = ~75K tokens per failure
+- **Noisy** — Spark driver logs contain verbose GC output, task progress, shuffle stats that obscure the actual error
+
+**The fix (sourced from SIAGI Self-Healing Agent pattern):** A dedicated regex pre-processor runs first, in <1 second, at zero LLM cost. It extracts only the signal:
+
+| What's extracted | How | Why |
+|-----------------|-----|-----|
+| Critical error section | Regex: last `Exception`, `Error`, `FAILED` block | The root cause, not the noise |
+| File candidates | Regex: paths matching `*.py`, `*.sql`, `*.yaml` near the error | Tells LLM which file to patch |
+| Line numbers | Regex: `line \d+`, `at .*:\d+` near the exception | Enables line-level patching |
+| Stack trace | Regex: indented `at ...` block | Context for root cause analysis |
+| Exit code | Regex: `exit code \d+`, `returncode=\d+` | Immediate bucket signal (137 = OOM) |
+
+**Output:** `{error_section, file_candidates, line_numbers, stack_trace, exit_code}` — typically 2–5K chars.
+
+**Rule: raw logs never reach the LLM or classifier.** Only the pre-processed extract is passed downstream.
+
+---
+
 ### Classifier evolution — ship v0 first, earn XGBoost
 
 **v0 (ship immediately — no training data needed):** The regex patterns in `FEATURE_SCHEMA` below already
@@ -299,7 +332,7 @@ INCIDENT_SCHEMA = {
     'bucket':               str,    # R1–R9
     'classifier_confidence': float,
     'error_message':        str,
-    'log_snippet':          str,    # last 200 lines
+    'log_snippet':          str,    # pre-processed extract (2–5K chars, not raw 100K lines)
 
     # Resolution
     'resolution_type':      str,    # auto_retry | config_change | code_pr | ops_escalate
