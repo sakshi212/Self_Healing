@@ -4,22 +4,28 @@
 > **Design principle:** Cheap, deterministic layers handle 80% of failures instantly.
 > The AI brain activates only for novel or low-confidence cases — never burning tokens on known, cheap fixes.
 
+> **Honest expectation:** R3 (auth) and R4 (cert) — historically your highest-frequency real failures (expired PATs,
+> revoked SA keys) — are **not auto-fixable**. They require secret rotation by a human. This system targets
+> ~55–65% auto-resolution rate on the remaining buckets. Don't size this as a 100% replacement for on-call.
+
 ---
 
 ## Table of Contents
 
 1. [Failure Taxonomy](#1-failure-taxonomy)
 2. [Overall Architecture](#2-overall-architecture)
-3. [Layer 1–4: Deterministic Self-Healing (in-DAG)](#3-layers-14-deterministic-self-healing)
-4. [Layer 5: ML Classifier (XGBoost)](#4-layer-5-ml-classifier)
+3. [Layers 1–4: Deterministic Self-Healing](#3-layers-14-deterministic-self-healing)
+4. [Layer 5: ML Classifier](#4-layer-5-ml-classifier)
 5. [Layer 6: AI Orchestrator + Vector Memory](#5-layer-6-ai-orchestrator--vector-memory)
 6. [Layer 7: Resolution Executor](#6-layer-7-resolution-executor)
 7. [Layer 8: PR Factory + Security Gate](#7-layer-8-pr-factory--security-gate)
 8. [Confidence Score Definition](#8-confidence-score-definition)
-9. [Cold-Start & Shadow Mode](#9-cold-start--shadow-mode)
-10. [Circuit Breaker](#10-circuit-breaker)
-11. [Feedback Loop](#11-feedback-loop)
-12. [Implementation Roadmap](#12-implementation-roadmap)
+9. [Cascading Failure Debounce](#9-cascading-failure-debounce)
+10. [Observability & Cost Tracking](#10-observability--cost-tracking)
+11. [Cold-Start & Shadow Mode](#11-cold-start--shadow-mode)
+12. [Circuit Breaker](#12-circuit-breaker)
+13. [Feedback Loop](#13-feedback-loop)
+14. [Implementation Roadmap](#14-implementation-roadmap)
 
 ---
 
@@ -180,7 +186,21 @@ Detects zombie runs (age > 6h) → marks failed → unblocks `max_active_runs: 1
 
 ## 4. Layer 5: ML Classifier
 
-### Why XGBoost (not LLM-first)
+### Classifier evolution — ship v0 first, earn XGBoost
+
+**v0 (ship immediately — no training data needed):** The regex patterns in `FEATURE_SCHEMA` below already
+*are* a bucket classifier. Your `has_auth`, `has_cert`, `has_oom` patterns are mutually exclusive enough to
+route 70%+ of incidents correctly with zero ML. Ship this first. Collect labeled outcomes.
+
+**v1 (after 200+ labeled incidents):** Train XGBoost on those labels. Until then, XGBoost adds complexity
+with no accuracy gain over regexes on a cold dataset.
+
+| Classifier version | When to use | Cold-start? |
+|--------------------|------------|-------------|
+| v0: Regex rules | Now, Day 0 | Works immediately |
+| v1: XGBoost + TF-IDF | After 200 labeled incidents | Needs training data |
+
+### Why XGBoost over LLM-first (for v1+)
 
 | Criterion | XGBoost + TF-IDF | LLM-first |
 |-----------|-----------------|-----------|
@@ -355,10 +375,15 @@ def route_to_resolution(event: FailureEvent) -> ResolutionPlan:
 | Condition | Model | Reason |
 |-----------|-------|--------|
 | Vector similarity > 0.88 (known issue) | **None** — use history | Zero cost |
-| Novel issue, R2/R8 (code/dependency) | **Claude Opus** | Needs deep reasoning for code changes |
+| Novel issue, R2/R8 (code/dependency) | **Claude Haiku first → Opus if low confidence** | Haiku handles most patterns; Opus only for genuinely novel code reasoning |
 | Novel issue, R1/R5/R7 (infra/network/resource) | **Claude Haiku** | Pattern-matching sufficient, high volume |
 | R3/R4 (auth/cert) — any | **Haiku** for runbook lookup only | Never proposes auto-fix |
 | Confidence still < 0.6 after LLM | **Ops escalate** | Don't guess on prod |
+
+> **Internal knowledge first:** Before any web search, query Walmart internal sources via `content_search`
+> (Wibey MCP) — internal Stack Overflow, Confluence, internal GitHub issues. These have higher signal-to-noise
+> for Walmart-specific GCP configs, WCNP quirks, and pipeline patterns than public web results.
+> Web search (external) is last resort only.
 
 ---
 
@@ -366,25 +391,53 @@ def route_to_resolution(event: FailureEvent) -> ResolutionPlan:
 
 Four resolution paths — bucket determines path, confidence determines whether to execute.
 
-### Path A: Auto-Retry / Config Toggle
+### Path A: Parameter-Change + Retry
 ```
 Buckets: R1 (OOM → scale up), R5 (network → retry), R7 (cluster → safe recreate), R9 (upstream → wait)
 No code change, no sandbox needed.
 ```
-```python
-def execute_auto_retry(plan: ResolutionPlan, event: FailureEvent):
-    if plan.bucket == 'R1_resource' and 'OOM' in plan.proposed_fix:
-        # Scale up cluster memory via Airflow Variable
-        Variable.set(f'{event.dag_id}_worker_memory', '16g')
 
-    # Trigger DAG task retry via Airflow REST API
+> ⚠️ **Critical:** By the time Layer 4 escalates here, Layers 1–2 already retried 3×.
+> A plain retry is a no-op — it replays the same failure. **Path A MUST change a parameter
+> before retrying**, or it repeats exactly what the user reported: "auto-restart also failed."
+
+```python
+# Resolution actions indexed by bucket — each changes state before retrying
+PATH_A_ACTIONS = {
+    'R1_resource': [
+        # OOM: scale worker memory before retry
+        lambda e: Variable.set(f'{e.dag_id}_worker_memory',
+                               _scale_up(Variable.get(f'{e.dag_id}_worker_memory', '8g'))),
+        # quota: add 10-min wait before retry to let quota recover
+        lambda e: time.sleep(600) if 'quota' in e.error_message.lower() else None,
+    ],
+    'R5_network': [
+        # Flush any stuck connection pools — no-op in Airflow but forces new worker
+        lambda e: airflow_api.clear_task(e.dag_id, e.run_id, e.task_id),
+    ],
+    'R7_cluster': [
+        # Safe delete (idempotent) before allowing create to retry
+        lambda e: safe_delete_cluster(e.project_id, e.region, e.cluster_name),
+    ],
+    'R9_upstream': [
+        # Log current touch file state so retry has fresh info
+        lambda e: _log_touch_file_status(e),
+    ],
+}
+
+def execute_auto_retry(plan: ResolutionPlan, event: FailureEvent):
+    # Apply state-change action for this bucket
+    actions = PATH_A_ACTIONS.get(event.bucket, [])
+    for action in actions:
+        action(event)
+
+    # Now retry — state is different, not a replay
     airflow_api.patch_task_instance(
         dag_id=event.dag_id,
         dag_run_id=event.run_id,
         task_id=event.task_id,
         new_state='up_for_retry',
     )
-    # Record outcome in vector DB
     record_outcome(event, plan, resolution_attempted=True)
 ```
 
@@ -393,25 +446,53 @@ def execute_auto_retry(plan: ResolutionPlan, event: FailureEvent):
 Buckets: R2 (dependency), R6 (data/schema), R8 (code bug)
 Must pass sandbox + Snyk before PR.
 ```
+
+> **Sandbox cost reality:** "Run tests in staging" means spinning a Dataproc cluster ($15–30, 10–15 min).
+> Do NOT do this for every auto-generated fix. Use this two-tier approach:
+>
+> - **Tier 1 (always):** `pyspark` local-mode unit tests. Run in <2 min, $0, catches 80% of code bugs.
+> - **Tier 2 (only if Tier 1 passes):** Cloud Build integration test in staging env. Only for schema/Hudi changes where local-mode can't simulate GCS partitioning.
+
 ```python
 def execute_code_fix(plan: ResolutionPlan, event: FailureEvent):
     # 1. Create isolated sandbox branch
     branch = f'self-heal/{event.dag_id}-{event.incident_id[:8]}'
     git_client.create_branch(base='main', new_branch=branch)
 
-    # 2. Apply proposed diff to sandbox
+    # 2. Apply proposed diff
     git_client.apply_diff(branch, plan.fix_diff)
 
-    # 3. Run test suite in sandbox env (GCP Cloud Build / GitHub Actions)
-    test_result = sandbox.run_tests(
+    # 3a. Tier 1: pyspark local-mode unit tests (fast, cheap — always run)
+    unit_result = sandbox.run_unit_tests(
         branch=branch,
-        test_script=f'tests/test_{event.dag_id}.py',
-        env='staging',
-        timeout_mins=20,
+        test_script=f'tests/unit/test_{event.dag_id}.py',
+        mode='local',        # pyspark local[4], no cluster needed
+        timeout_mins=5,
     )
 
-    # 4. Snyk security scan (BLOCKING gate)
+    if not unit_result.passed:
+        notify_developer(event, pr_url=None, confidence=0,
+                        failure_reason='Unit tests failed', test_result=unit_result)
+        return  # Don't proceed to integration or PR
+
+    # 3b. Tier 2: integration test only for schema/data changes (costs cluster)
+    integration_result = None
+    if event.bucket in ['R6_data'] or 'hudi' in event.task_id.lower():
+        integration_result = sandbox.run_integration_tests(
+            branch=branch,
+            env='staging',
+            timeout_mins=20,
+        )
+
+    # 4. Snyk security scan + secret detection (BLOCKING gates)
     snyk_result = snyk.scan(branch)
+
+    # Secret scan: never allow bot to commit credentials into generated code
+    # (self-healing session itself has pasted live PATs — the bot must not do the same)
+    secret_scan = detect_secrets.scan_diff(plan.fix_diff)
+    if secret_scan.has_secrets:
+        escalate_to_ops(plan, event, reason='Generated code contains potential secrets — blocked')
+        return
 
     # 5. Compute final confidence — only PR if > 90%
     confidence = compute_confidence(plan, test_result, snyk_result)
@@ -543,45 +624,197 @@ jobs:
 
 ## 8. Confidence Score Definition
 
-Confidence is a **conjunctive (product) combiner** — not a weighted sum.
-A single near-zero factor kills the gate, regardless of others.
+### Why NOT a product formula
+
+The original v1 of this doc used `P_classifier × P_vector × P_success_rate`. That's wrong for correlated
+signals: when a failure is "known" (seen many times before), **both** P_classifier and P_vector will be high
+together — they carry the same information. Multiplying them double-penalizes the best cases.
+
+**Proof:** Known OOM seen 20× → P_cls=0.97, P_vec=0.95, P_success=0.92.
+Product = 0.85 → below the 0.90 gate → auto-retry **never fires** on your most healable case. The formula was self-defeating.
+
+### Correct formula: min() for probabilistic signals, hard gates for binary checks
 
 ```
-confidence = P_classifier × P_vector × P_success_rate × P_sandbox × P_snyk
+confidence = min(P_classifier, P_vector, P_success_rate)
+
+PLUS hard boolean gates (veto power — any failure blocks the path):
+  sandbox_passed  : bool  — all unit tests passed  (required for code PR)
+  snyk_passed     : bool  — no high/critical CVEs   (required for code PR)
+  secret_clean    : bool  — no credentials in diff  (required for code PR)
+
+Effective rule:
+  For code/config PR:  confidence = min(...) AND sandbox_passed AND snyk_passed AND secret_clean
+  For auto-retry:      confidence = min(P_classifier, P_success_rate)  [P_vector not applicable]
 
 Where:
-  P_classifier   = XGBoost probability for predicted bucket         [0.0 – 1.0]
-  P_vector       = cosine similarity to best matching past incident [0.0 – 1.0]
-                   (= 0.5 if no past incident found — cold start penalty)
-  P_success_rate = historical success rate of this resolution type  [0.0 – 1.0]
-                   (= 0.7 default if < 3 past incidents of this type)
-  P_sandbox      = 1.0 if all tests passed, 0.0 if any test failed
-                   (= 1.0 for auto-retry paths, no sandbox needed)
-  P_snyk         = 1.0 if no high/critical vulnerabilities, 0.0 otherwise
-                   (= 1.0 for auto-retry paths)
+  P_classifier   = XGBoost (or regex-rules) probability for predicted bucket   [0.0 – 1.0]
+  P_vector       = cosine similarity to best matching past incident             [0.0 – 1.0]
+                   (= 0.50 if no past incident — cold start penalty)
+  P_success_rate = historical success rate of this fix type                    [0.0 – 1.0]
+                   (= 0.65 default if < 3 past incidents of this type)
 
-Threshold:
-  confidence ≥ 0.90 → create PR
-  0.70 ≤ confidence < 0.90 → advisory alert (proposed fix shown to dev, no PR)
-  confidence < 0.70 → ops escalate, store in vector DB as low-confidence incident
+Thresholds:
+  confidence ≥ 0.90 AND all gates pass  → create PR  (or execute auto-retry)
+  0.70 ≤ confidence < 0.90              → advisory alert only, no execution
+  confidence < 0.70                     → ops escalate
 ```
 
-### Example calculations
+```python
+def compute_confidence(plan, unit_result=None, integration_result=None,
+                       snyk_result=None, secret_result=None) -> float:
+    # Probabilistic signals — min(), not product
+    p_signals = [plan.classifier_confidence, plan.historical_success_rate]
+    if plan.vector_similarity is not None:
+        p_signals.append(plan.vector_similarity)
 
-| Scenario | P_cls | P_vec | P_success | P_sandbox | P_snyk | **Score** | Action |
-|----------|-------|-------|-----------|-----------|--------|-----------|--------|
-| Known OOM, seen 20× before, retry works | 0.97 | 0.95 | 0.92 | 1.0 | 1.0 | **0.85** | Auto-retry |
-| Package mismatch, similar past fix, tests pass | 0.91 | 0.88 | 0.85 | 1.0 | 1.0 | **0.68** | Advisory only |
-| Novel code bug, LLM proposes fix, tests pass | 0.78 | 0.55 | 0.70 | 1.0 | 1.0 | **0.30** | Ops escalate |
-| Known schema fix, tests pass, Snyk finds CVE | 0.95 | 0.91 | 0.90 | 1.0 | **0.0** | **0.0** | Blocked — Snyk |
+    confidence = min(p_signals)
 
-> **Calibration:** Start with these default thresholds, then tune against your labeled historical incidents.
-> Use isotonic regression on XGBoost output probabilities to get calibrated P_classifier scores.
-> Re-evaluate thresholds quarterly. Begin in **shadow mode** (propose but don't execute) for first 30 days.
+    # Hard boolean gates — veto any execution
+    if unit_result and not unit_result.passed:
+        return 0.0   # Tests failed — never PR
+    if snyk_result and not snyk_result.passed:
+        return 0.0   # Security issue — never PR
+    if secret_result and secret_result.has_secrets:
+        return 0.0   # Credentials in generated code — never PR
+
+    return confidence
+```
+
+### Corrected example calculations
+
+| Scenario | P_cls | P_vec | P_success | min() | Gates | **Score** | Action |
+|----------|-------|-------|-----------|-------|-------|-----------|--------|
+| Known OOM, seen 20× before, retry works | 0.97 | 0.95 | 0.92 | **0.92** | N/A (retry) | **0.92** | ✅ Auto-retry |
+| Package mismatch, similar fix, tests pass | 0.91 | 0.88 | 0.85 | **0.85** | All pass | **0.85** | Advisory only |
+| Novel code bug, LLM proposes fix, tests pass | 0.78 | 0.55 | 0.70 | **0.55** | All pass | **0.55** | Ops escalate |
+| Known schema fix, Snyk finds CVE | 0.95 | 0.91 | 0.90 | 0.90 | Snyk=FAIL | **0.0** | Blocked — Snyk |
+| Cold start (no vector history) | 0.91 | 0.50 | 0.65 | **0.50** | All pass | **0.50** | Ops escalate |
+
+> **Calibration:** Use isotonic regression on XGBoost output probabilities to get calibrated scores.
+> Start all thresholds in shadow mode — measure proposed-vs-actual accuracy for 30 days before
+> enabling execution. Re-evaluate thresholds quarterly against labeled outcomes in vector DB.
 
 ---
 
-## 9. Cold-Start & Shadow Mode
+## 9. Cascading Failure Debounce
+
+**Problem (and why it matters):** When a Dataproc cluster fails to create (R7), every downstream task
+in that DAG run — load tasks, sensors, Hudi writes — all fail too. Without debouncing, one cluster failure
+generates 15–20 separate events → 15–20 LLM calls → exactly the cost this system was built to avoid.
+
+**Rule: Heal once per root cause, not once per symptom.**
+
+```python
+# debouncer/root_cause.py
+
+TASK_DEPENDENCY_ORDER = ['create_cluster', 'wait_touch', 'extract', 'load', 'hudi', 'bq']
+
+def find_root_task(events: List[FailureEvent]) -> FailureEvent:
+    """
+    Given multiple failures from the same dag_run_id, return the earliest
+    task in the dependency chain — that's the root cause. Ignore the rest.
+    """
+    # Group by dag_run_id
+    by_run = defaultdict(list)
+    for e in events:
+        by_run[e.run_id].append(e)
+
+    root_events = []
+    for run_id, run_events in by_run.items():
+        # Find task earliest in dependency order
+        def task_rank(event):
+            for i, pattern in enumerate(TASK_DEPENDENCY_ORDER):
+                if pattern in event.task_id.lower():
+                    return i
+            return 99
+
+        root = min(run_events, key=task_rank)
+        root_events.append(root)
+
+    return root_events
+
+
+# Pub/Sub subscriber: debounce window before triggering AI brain
+def debounced_subscriber():
+    DEBOUNCE_WINDOW_SECS = 120  # collect all failures for 2 min after first one
+
+    pending: Dict[str, List[FailureEvent]] = defaultdict(list)
+
+    while True:
+        event = pubsub.pull()
+        pending[event.run_id].append(event)
+
+        # After debounce window, find root cause and heal once
+        if time_since_first(pending[event.run_id]) > DEBOUNCE_WINDOW_SECS:
+            roots = find_root_task(pending.pop(event.run_id))
+            for root in roots:
+                trigger_ai_brain(root)   # one call per run, not per task
+```
+
+> **Example:** Cluster create fails → 18 downstream tasks fail.
+> Without debounce: 18 LLM calls. With debounce: **1 call** on `create_cluster`.
+> After root is fixed, the DAG run is cleared — all 18 tasks retry together.
+
+---
+
+## 10. Observability & Cost Tracking
+
+Without metrics, you cannot prove the system works — or justify its cost.
+
+```python
+# observability/metrics.py — push to Cloud Monitoring
+
+METRICS = {
+    # Effectiveness
+    'incidents_total':           Counter,   # all failures received
+    'incidents_auto_resolved':   Counter,   # auto-retry succeeded
+    'incidents_pr_created':      Counter,   # code PR generated
+    'incidents_ops_escalated':   Counter,   # sent to human
+    'auto_heal_rate':            Gauge,     # auto_resolved / total (target: 55–65%)
+
+    # Speed
+    'mttr_auto_mins':            Histogram, # mean time to resolve (auto path)
+    'mttr_pr_merge_mins':        Histogram, # mean time from PR created to merged
+
+    # Quality
+    'confidence_score_dist':     Histogram, # distribution of confidence scores
+    'pr_merged_without_edit':    Counter,   # dev merged as-is (high AI quality)
+    'pr_closed_without_merge':   Counter,   # dev rejected (penalize in vector DB)
+    'false_positive_rate':       Gauge,     # PRs that introduced new failures
+
+    # Cost
+    'llm_tokens_haiku':          Counter,   # Haiku tokens consumed
+    'llm_tokens_opus':           Counter,   # Opus tokens consumed
+    'llm_cost_usd':              Counter,   # total $ spent on LLM per day
+    'sandbox_cluster_mins':      Counter,   # Tier 2 integration test cluster time
+}
+
+# Dashboard: Cloud Monitoring custom dashboard or Grafana
+# SLA alert: if auto_heal_rate drops below 40% for 24h → alert eng lead
+```
+
+### Bot account blast radius
+
+The PR bot needs write access to create branches and PRs. Limit the damage:
+
+```
+Bot account: svc-self-heal-bot (dedicated, not a shared SA)
+Permissions:
+  - Create branch: YES
+  - Push to branch: YES (own branch only, not main/release)
+  - Create PR: YES
+  - Approve PR: NO  (branch protection rule: bot approvals don't count)
+  - Merge PR: NO    (never — developer-only)
+  - Delete branch: YES (own branches only, after merge)
+  - Access secrets/env vars: NO
+
+Branch naming: self-heal/* (protected: cannot be pushed to by humans accidentally)
+```
+
+---
+
+## 11. Cold-Start & Shadow Mode
 
 **Problem:** The vector DB starts empty — no historical incidents to match against.
 
@@ -611,7 +844,7 @@ def execute(plan, event):
 
 ---
 
-## 10. Circuit Breaker
+## 12. Circuit Breaker
 
 **Problem:** Without a circuit breaker, the AI brain can loop — proposing and retrying the same fix indefinitely on a fundamentally broken pipeline.
 
@@ -660,7 +893,7 @@ if not SAFE_TO_RETRY.get(task_write_mode, False):
 
 ---
 
-## 11. Feedback Loop
+## 13. Feedback Loop
 
 The feedback loop is what converts this system from a static rule engine into a **learning system**. Confidence becomes empirical over time.
 
@@ -700,13 +933,32 @@ def record_outcome(event: FailureEvent, plan: ResolutionPlan,
 
 ### Feedback triggers
 - **Auto-retry success:** Airflow task transitions from `up_for_retry` → `success` (Airflow webhook)
-- **PR merged:** GitHub webhook → `pull_request.merged` event
+- **PR merged as-is:** GitHub webhook `pull_request.merged` + diff unchanged → high quality signal
+- **PR merged with edits:** Compare AI-proposed diff vs final merged diff. If edit distance > 30% → penalize
+  that pattern. The fix was wrong enough that the developer rewrote it — don't reuse it as a template.
 - **PR closed without merge:** penalize that fix pattern in vector DB
 - **Manual fix required after auto-attempt:** developer records via Slack command `/self-heal feedback {incident_id} failed`
 
+```python
+# GitHub webhook handler
+def on_pr_merged(pr_event):
+    incident_id = extract_incident_id(pr_event['pull_request']['body'])
+    ai_diff = vector_db.get(incident_id)['fix_diff']
+    final_diff = github.get_merged_diff(pr_event['pull_request']['number'])
+
+    edit_distance_pct = diff_similarity(ai_diff, final_diff)
+
+    record_outcome(
+        incident_id=incident_id,
+        resolution_successful=True,
+        pr_merged=True,
+        ai_fix_accuracy=1.0 - edit_distance_pct,  # 1.0 = merged as-is, 0.3 = heavily edited
+    )
+```
+
 ---
 
-## 12. Implementation Roadmap
+## 14. Implementation Roadmap
 
 | Phase | What | Deliverable | Duration |
 |-------|------|-------------|----------|
