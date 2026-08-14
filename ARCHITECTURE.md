@@ -16,7 +16,7 @@
 2. [Overall Architecture](#2-overall-architecture)
 3. [Layers 1–4: Deterministic Self-Healing](#3-layers-14-deterministic-self-healing)
 4. [Layer 5: ML Classifier](#4-layer-5-ml-classifier)
-5. [Layer 6: AI Orchestrator + Vector Memory](#5-layer-6-ai-orchestrator--vector-memory)
+5. [Layer 6: AI Orchestrator + Neo4j Knowledge Graph](#5-layer-6-ai-orchestrator--neo4j-knowledge-graph)
 6. [Layer 7: Resolution Executor](#6-layer-7-resolution-executor)
 7. [Layer 8: PR Factory + Security Gate](#7-layer-8-pr-factory--security-gate)
 8. [Confidence Score Definition](#8-confidence-score-definition)
@@ -54,56 +54,57 @@ Every pipeline failure maps to one of 9 buckets. The bucket determines the **res
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         PIPELINE FAILURE EVENT                               │
-│             (Airflow on_failure_callback → Pub/Sub topic)                   │
+│    Airflow on_failure_callback → FastAPI Heal Server → Pub/Sub topic        │
+│    Downstream DAGs paused immediately via BFS lineage traversal             │
 └──────────────────────────────┬──────────────────────────────────────────────┘
-                               │  {dag_id, task_id, run_id, error_msg, log_url}
+                               │  {dag_id, task_id, run_id, log_url}
                                ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│  LOG PRE-PROCESSOR  (Stage 1 — always runs, <1 sec, zero LLM cost)           │
-│  • Pull full logs from GCS/Stackdriver  (100K+ lines raw)                    │
-│  • Regex extracts: critical error section, file candidates, line numbers,    │
-│    stack trace, last meaningful exception — reduces to 2–5K chars            │
-│  • Raw logs are NEVER sent to LLM or classifier — only the extracted section │
-│  • Output: {error_section, file_candidates, line_numbers, log_extract}       │
-└──────────────────────────────────────────────────────────────────────────────┘
-                               │  2–5K chars (not 100K)
+│  LOG PRE-PROCESSOR  (<1 sec, zero LLM cost)                                  │
+│  Pulls raw logs from GCS/Stackdriver (100K+ lines)                           │
+│  Regex extracts: error section, stack trace, file candidates,                │
+│  line numbers, exit code → output: 2–5K char bounded extract                │
+│  Raw logs NEVER reach the classifier or LLM                                  │
+└──────────────────────────────┬──────────────────────────────────────────────┘
+                               │  bounded extract
                                ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│  LAYER 5 — ML Classifier (Stage 2)                                            │
-│  • Extract 50+ structured features from compressed log_extract               │
-│  • v0: Regex rules classify R1–R9 bucket (<1 sec, $0)                        │
-│  • v1: XGBoost classifies R1–R9 bucket  (<100ms, no LLM cost)               │
-│  • Output: {bucket, confidence_score, extracted_features}                    │
-└──────────────────────────────────────────────────────────────────────────────┘
-                               │
-          ┌────────────────────┼────────────────────┐
-          │ confidence > 0.85  │                     │ confidence < 0.85
-          ▼                    │                     ▼
-  Known issue,                 │          ┌──────────────────────────┐
-  bucket confirmed             │          │  LLM Enricher (Haiku)    │
-          │                    │          │  Re-classifies, extracts │
-          │                    │          │  root cause summary       │
-          │                    │          └──────────┬───────────────┘
-          └────────────────────┴──────────────────── ┘
-                               │
-                               ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  LAYER 6 — AI Orchestrator (2nd Brain)                                        │
-│  Input: {bucket, features, error_summary}                                     │
+│  LAYER 5 — 4-TIER CLASSIFICATION                                              │
 │                                                                               │
-│  ┌─────────────────────┐          ┌────────────────────────────────────────┐ │
-│  │  Vector DB Query    │          │  Web Search Agent (if no match)        │ │
-│  │  Pinecone / Vertex  │          │  • Claude Opus: complex/novel issues   │ │
-│  │  AI Vector Search   │          │  • Claude Haiku: known error patterns  │ │
-│  │                     │          │  • Walmart internal Stack Overflow     │ │
-│  │  similarity_score,  │          │  • GitHub issues, GCP docs             │ │
-│  │  past_resolution,   │◄────────►│                                        │ │
-│  │  success_rate       │          └────────────────────────────────────────┘ │
-│  └─────────────────────┘                                                      │
+│  Tier 1 │ Regex / signature match      → known pattern? → route directly    │
+│  Tier 2 │ Fuzzy match vs history       → near-duplicate? → reuse resolution  │
+│  Tier 3 │ Embedding semantic similarity → confidence ≥ 0.90? → route        │
+│          │   weighted bucket vote + label agreement + remediation divergence  │
+│  Tier 4 │ Ambiguous / novel → Gemini agentic RCA                            │
 │                                                                               │
-│  Output: {resolution_type, proposed_fix, confidence_score}                   │
-└──────────────────────────────────────────────────────────────────────────────┘
+│  Each tier is a gate — Gemini fires only when tiers 1–3 all fail            │
+└──────────────────────────────┬──────────────────────────────────────────────┘
                                │
+          ┌────────────────────┴──────────────────────────────┐
+          │  Tiers 1–3 resolved                               │  Tier 4: Gemini
+          ▼                                                   ▼
+  {bucket, resolution_type,           ┌────────────────────────────────────────┐
+   confidence ≥ 0.90}                 │  GEMINI AGENTIC RCA                    │
+                                      │  Small initial prompt (bounded extract  │
+                                      │  + job metadata + top 3 incidents)     │
+                                      │                                        │
+                                      │  Hypothesis → tool calls → evidence    │
+                                      │  MCP tools: DAG metadata, execution    │
+                                      │  environment, recent changes,          │
+                                      │  historical incidents                  │
+                                      │                                        │
+                                      │  Returns Pydantic-structured response: │
+                                      │  problem summary, supporting evidence, │
+                                      │  root cause, confidence, ranked fixes  │
+                                      │  evidence_sufficient flag              │
+                                      │                                        │
+                                      │  Neo4j knowledge graph queried for    │
+                                      │  runbooks + validated resolutions      │
+                                      └────────────────────┬───────────────────┘
+                               ┌──────────────────────────┘
+                               │  {resolution_type, proposed_fix,
+                               │   confidence_score, evidence_sufficient}
+                               ▼
           ┌────────────────────┼──────────────────────────────┐
           │                    │                              │
           ▼                    ▼                              ▼
@@ -334,111 +335,214 @@ Use SHAP to explain predictions — helps developers trust and audit the classif
 
 ---
 
-## 5. Layer 6: AI Orchestrator + Vector Memory
+## 5. Layer 6: AI Orchestrator + Neo4j Knowledge Graph
 
-### Vector Database Schema
+### Knowledge Graph — not a flat vector store
 
-```python
-# Pinecone / Vertex AI Vector Search / ChromaDB
+Historical incidents are stored in a **Neo4j graph database** rather than a flat vector index. This matters because pipeline failures have rich relational structure that a flat index loses:
 
-INCIDENT_SCHEMA = {
-    # Identity
-    'incident_id':          str,    # UUID
-    'timestamp':            datetime,
-    'dag_id':               str,
-    'task_id':              str,
-    'run_id':               str,
-    'environment':          str,    # dev/stg/prod
-
-    # Classification
-    'bucket':               str,    # R1–R9
-    'classifier_confidence': float,
-    'error_message':        str,
-    'log_snippet':          str,    # pre-processed extract (2–5K chars, not raw 100K lines)
-
-    # Resolution
-    'resolution_type':      str,    # auto_retry | config_change | code_pr | ops_escalate
-    'proposed_fix':         str,    # human-readable description
-    'fix_diff':             str,    # actual code/config diff (if code_pr)
-    'pr_url':               str,    # GitHub PR URL (if created)
-
-    # Outcome (written back after resolution)
-    'resolution_successful': bool,
-    'time_to_resolve_mins':  int,
-    'sandbox_passed':        bool,
-    'snyk_passed':           bool,
-    'confidence_score':      float,  # final composite score
-
-    # Vector embedding (for similarity search)
-    # Embed: error_message + log_snippet + bucket + task_id
-    'embedding':            List[float],  # 768-dim, text-embedding-004 or ada-002
-}
+```
+(Incident) -[:AFFECTS]→ (DAG)
+(Incident) -[:CAUSED_BY]→ (RootCause)
+(Incident) -[:RESOLVED_BY]→ (Resolution)
+(Resolution) -[:VALIDATED_IN]→ (SandboxRun)
+(DAG) -[:DEPENDS_ON]→ (DAG)           ← lineage
+(DAG) -[:READS_FROM]→ (Dataset)
+(RootCause) -[:SIMILAR_TO]→ (RootCause)  ← semantic edges
+(Runbook) -[:APPLIES_TO]→ (RootCause)
 ```
 
-### Orchestrator Flow
+**What the graph stores:**
 
-```python
-# orchestrator/brain.py
+| Node type | Contents |
+|-----------|----------|
+| Incident | incident_id, dag_id, task_id, timestamp, bucket, pre-processed log extract (2–5K chars), environment |
+| RootCause | root_cause_type, description, supporting_evidence (log signals cited), bucket |
+| Resolution | resolution_type (auto_retry / config_change / code_pr / ops_escalate), proposed_fix, fix_diff, pr_url |
+| SandboxRun | sandbox_passed, snyk_passed, secret_clean, test_results, confidence_score, outcome |
+| Runbook | title, steps, applies_to_bucket, validated_by_engineer, last_updated |
+| DAG | dag_id, dependencies, datasets_read, datasets_written, execution_environment |
 
-def route_to_resolution(event: FailureEvent) -> ResolutionPlan:
-    # Step 1: Query vector DB for similar past incidents
-    similar = vector_db.query(
-        vector=embed(event.error_message + event.log_snippet),
-        top_k=5,
-        filter={'bucket': event.bucket}
-    )
+**Why graph over flat vector index:** When Gemini needs to understand whether a dependency failure in DAG-A could be upstream of a schema failure in DAG-B, a graph traversal finds that connection in milliseconds. A flat vector index can't express or query that relationship.
 
-    if similar and similar[0]['score'] > 0.88:
-        # HIGH SIMILARITY — propose resolution from history
-        past = similar[0]
-        return ResolutionPlan(
-            source='vector_db',
-            resolution_type=past['resolution_type'],
-            proposed_fix=past['proposed_fix'],
-            historical_success_rate=_success_rate(similar),
-            vector_similarity=similar[0]['score'],
-            model_used='none',  # no LLM needed
-        )
-    else:
-        # LOW SIMILARITY or NOVEL — invoke LLM
-        model = 'claude-opus-4' if event.bucket in ['R2_dependency', 'R8_code'] else 'claude-haiku-4'
+---
 
-        llm_analysis = llm_client.messages.create(
-            model=model,
-            messages=[{
-                'role': 'user',
-                'content': RESOLUTION_PROMPT.format(
-                    bucket=event.bucket,
-                    error=event.error_message,
-                    logs=event.log_snippet,
-                    similar_incidents=_format_similar(similar),
-                    dag_context=event.dag_id + '/' + event.task_id,
-                )
-            }],
-            max_tokens=2000,
-        )
+### Orchestration Flow — 4 tiers before Gemini fires
 
-        return ResolutionPlan(
-            source='llm_search',
-            **_parse_llm_response(llm_analysis),
-            model_used=model,
-        )
+```
+Failure event arrives (from log pre-processor + classifier)
+              │
+              │  Pre-processed log extract + bucket + confidence
+              ▼
+┌─────────────────────────────────────────────────────────┐
+│  TIER 1: Regex / Signature Match                         │
+│  Known, repetitive patterns (OOM, auth failure,         │
+│  network timeout, missing library, expired credentials) │
+│  → Deterministic route, zero LLM cost                   │
+│  → If matched with high confidence: skip tiers 2–4       │
+└─────────────────────────┬───────────────────────────────┘
+                          │ No match
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│  TIER 2: Fuzzy Match against Historical Incidents        │
+│  Near-duplicate or structurally similar past failures    │
+│  Corpus: prior incidents + validated RCAs + runbooks    │
+│  → If structurally similar: retrieve resolution, apply  │
+│  → No generative reasoning needed                        │
+└─────────────────────────┬───────────────────────────────┘
+                          │ No sufficiently similar match
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│  TIER 3: Embedding Semantic Similarity                   │
+│  Generate embedding from normalized error context        │
+│  Retrieve top-K historical incidents from vector index   │
+│  Apply: weighted bucket vote + label agreement penalty   │
+│         + remediation path divergence check              │
+│  → If confidence ≥ 0.90: route to known remediation     │
+│  → If 0.70–0.90: advisory alert, no auto-execution      │
+│  → If < 0.70: escalate to Tier 4                        │
+└─────────────────────────┬───────────────────────────────┘
+                          │ Ambiguous / novel / confidence < 0.70
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│  TIER 4: Gemini Agentic RCA                             │
+│  Unknown or ambiguous failure — reasoning required       │
+│  Gemini 2.5 Pro reasons over bounded evidence context   │
+│  Uses MCP tools to gather additional evidence on-demand  │
+│  Returns Pydantic-structured response (no free text)     │
+│  → Confidence scored → remediation ranked → PR or alert │
+└─────────────────────────────────────────────────────────┘
 ```
 
-### Model routing logic
+**Why this tier ordering:** Known failures should be handled deterministically. Semantic retrieval handles variation in how similar failures appear. Gemini is reserved for cases where reasoning across multiple pieces of evidence actually adds value — not as a default first call.
+
+---
+
+### Tier 4: Gemini Context Window Construction
+
+This is the most consequential design decision in the entire system. Sending the wrong context produces hallucinated root causes. Sending too much context buries the signal in noise.
+
+**What we do NOT send:**
+- The full Airflow task log (100K+ lines — too noisy, fills context window)
+- The entire DAG dependency graph (too broad — most of it is irrelevant to this failure)
+- Infrastructure metrics for the entire cluster (only the relevant subset matters)
+- Any hypothesis the system itself generated (the model cannot treat its own prior output as evidence)
+
+**What the initial prompt contains (kept small intentionally):**
+
+```
+1. Normalized failure context
+   — Pre-processed log extract: ~50 lines before + ~50 lines after the primary failure signal
+   — Exception type, message, stack trace, exit code
+   — Not the full log — the log pre-processor already isolated the relevant region
+
+2. Basic job metadata
+   — dag_id, task_id, execution_date, retry count
+   — Job type (Spark, dbt, BQ, sensor)
+   — Execution environment (cluster config summary, not full spec)
+
+3. Most relevant historical incidents (top 3 from Tier 3 retrieval)
+   — Each incident: error summary, bucket, resolution type, outcome
+   — Included even when confidence was low — they provide contrast for Gemini to reason against
+```
+
+**Why the initial prompt is small:** Gemini follows an evidence-gathering workflow — it does not receive every possible piece of infrastructure context upfront. It forms a hypothesis first, then uses tools to validate or disprove it.
+
+---
+
+### Gemini's Agentic Reasoning Loop
+
+Gemini does not produce a root cause in a single shot. It follows a structured reasoning loop using approved MCP tools:
+
+```
+Initial prompt (small, bounded)
+        │
+        ▼
+  Form hypothesis
+  "This looks like an OOM caused by shuffle spill — need to check
+   executor memory config and recent data volume changes"
+        │
+        ▼
+  Tool call: DAG metadata tool
+  → DAG topology, upstream dependencies, datasets written/read
+  → "Upstream DAG wrote 3× normal volume yesterday"
+        │
+        ▼
+  Tool call: Execution environment tool
+  → Airflow/Astronomer config: task concurrency, DAG concurrency
+  → Dataproc cluster status: executor count, memory per executor
+  → "Cluster was running at 90% memory utilization"
+        │
+        ▼
+  Corroborate or revise hypothesis
+  "Confirmed: shuffle spill caused by upstream volume spike × fixed
+   executor memory. Not a code bug — a config threshold issue."
+        │
+        ▼
+  Structured response (Pydantic-enforced)
+```
+
+**The MCP tools Gemini can call:**
+
+| Tool | What it returns | Why bounded |
+|------|----------------|-------------|
+| `get_dag_metadata` | DAG topology, upstream/downstream deps, datasets | Only this DAG's lineage — not the full pipeline graph |
+| `get_execution_environment` | Airflow task config, Dataproc cluster status, resource utilization | Scoped to this run — not cluster-wide history |
+| `get_recent_changes` | Code/config changes in the last 48h for this DAG's repo path | Bounded to relevant files — not full repo diff |
+| `get_historical_incidents` | Additional incident retrieval from knowledge graph | Up to 5 more incidents beyond initial context |
+
+**What Gemini cannot do:**
+- Call external APIs or browse the web
+- Modify any production system
+- Issue a retry or create a PR directly — it only produces a structured recommendation
+- Accept its own prior turn's hypothesis as evidence in the final response
+
+---
+
+### Structured Response Format (Pydantic-enforced)
+
+Gemini's output is not free text. It is validated against a Pydantic schema before the orchestrator accepts it. Any response that doesn't conform is rejected and re-prompted (up to 2 retries, then ops escalate).
+
+**Required fields in the structured response:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `problem_summary` | string | One sentence, plain English |
+| `supporting_evidence` | list[string] | Each item must cite a specific log signal, retrieved incident, tool result, or infrastructure state — no unsupported assertions |
+| `root_cause_hypothesis` | string | The most likely root cause, grounded in the evidence above |
+| `confidence_score` | float [0–1] | Gemini's self-assessed confidence, used alongside our computed score |
+| `remediation_options` | list[RemediationOption] | Ranked list, each with: fix description, resolution_type, estimated risk level |
+| `evidence_sufficient` | bool | FALSE if Gemini cannot establish enough supporting evidence → triggers ops escalate instead of remediation |
+| `unresolved_aspects` | list[string] | What Gemini couldn't determine — passed to engineer in escalation alert |
+
+**The `evidence_sufficient` field is the hallucination guard.** If Gemini cannot cite specific log signals, retrieved incidents, or tool results to support its conclusion, it must set `evidence_sufficient = FALSE` and return an unresolved diagnosis. The orchestrator treats this as ops escalate — not as a low-confidence remediation attempt.
+
+---
+
+### Hallucination Prevention — All Six Mechanisms
+
+| Mechanism | How it prevents hallucination |
+|-----------|-------------------------------|
+| **Pre-processed log extract** | Gemini reasons over the actual failure signal, not a vague description of it |
+| **Evidence citation requirement** | Every claim in `supporting_evidence` must trace to a specific source — log line, tool result, or retrieved incident |
+| **`evidence_sufficient` gate** | Model explicitly declares when it doesn't have enough to conclude — prevents fabricated confidence |
+| **Pydantic structured output** | Free-text hallucinations can't propagate — response is schema-validated before acceptance |
+| **Sandbox validation** | Any proposed fix is tested in isolation before it reaches a PR — hallucinated fixes fail tests |
+| **Human approval gate** | No production change happens without an engineer reviewing the PR — final safety net |
+
+---
+
+### Model Routing
 
 | Condition | Model | Reason |
 |-----------|-------|--------|
-| Vector similarity > 0.88 (known issue) | **None** — use history | Zero cost |
-| Novel issue, R2/R8 (code/dependency) | **Claude Haiku first → Opus if low confidence** | Haiku handles most patterns; Opus only for genuinely novel code reasoning |
-| Novel issue, R1/R5/R7 (infra/network/resource) | **Claude Haiku** | Pattern-matching sufficient, high volume |
-| R3/R4 (auth/cert) — any | **Haiku** for runbook lookup only | Never proposes auto-fix |
-| Confidence still < 0.6 after LLM | **Ops escalate** | Don't guess on prod |
+| Tier 1/2 match (known pattern) | **None** | Zero LLM cost — deterministic |
+| Tier 3 confidence ≥ 0.90 | **None** | History sufficient — no reasoning needed |
+| Tier 4 — infra/resource failures (R1, R5, R7) | **Gemini 2.5 Flash** | Pattern reasoning, high volume, cost-sensitive |
+| Tier 4 — code/dependency failures (R2, R8) | **Gemini 2.5 Pro** | Needs deeper reasoning over code context and dependency trees |
+| Tier 4 — any, Gemini confidence still < 0.60 | **Ops escalate** | Don't guess on prod |
 
-> **Internal knowledge first:** Before any web search, query Walmart internal sources via `content_search`
-> (Wibey MCP) — internal Stack Overflow, Confluence, internal GitHub issues. These have higher signal-to-noise
-> for Walmart-specific GCP configs, WCNP quirks, and pipeline patterns than public web results.
-> Web search (external) is last resort only.
+> **Internal knowledge first:** Before any external reasoning, the knowledge graph is queried for matching runbooks and validated resolutions. Walmart-internal Confluence, internal Stack Overflow (via `content_search` MCP), and internal GitHub issues carry higher signal than public documentation for Walmart-specific GCP configs, WCNP quirks, and pipeline patterns.
 
 ---
 
