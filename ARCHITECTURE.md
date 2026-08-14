@@ -231,19 +231,41 @@ with no accuracy gain over regexes on a cold dataset.
 | Classifier version | When to use | Cold-start? |
 |--------------------|------------|-------------|
 | v0: Regex rules | Now, Day 0 | Works immediately |
-| v1: XGBoost + TF-IDF | After 200 labeled incidents | Needs training data |
+| v1: Embedding + cosine similarity | After ~150 labeled examples (20/bucket) | Few-shot friendly |
+| v2: XGBoost on structured bool features | Optional ensemble on top of v1 | Needs more data |
 
-### Why XGBoost over LLM-first (for v1+)
+### Why embedding-based over XGBoost + TF-IDF (for v1)
 
-| Criterion | XGBoost + TF-IDF | LLM-first |
-|-----------|-----------------|-----------|
-| Latency | <100ms | 2–10s |
-| Cost | ~$0 | $0.01–0.10/call |
-| Volume | Every failure | Only novel ones |
-| Accuracy on known errors | 92–96% (trained on logs) | High but variable |
-| Interpretable | Yes (SHAP values) | No |
+**TF-IDF treats text as word counts — it can't tell these three are all OOM (R1):**
+```
+"GC overhead limit exceeded"
+"exit code 137"
+"java.lang.OutOfMemoryError: Java heap space"
+```
+They look completely different to TF-IDF. XGBoost would need all three variants many times to learn they're the same bucket.
 
-**Decision: XGBoost classifies everything. LLM activates only when XGBoost confidence < 0.85.**
+**Embeddings convert text to vectors where similar meaning → similar vector**, so all three cluster together automatically — even unseen phrasings.
+
+| Criterion | Embedding + cosine | XGBoost + TF-IDF | LLM-first |
+|-----------|-------------------|-----------------|-----------|
+| Latency | ~50ms | <100ms | 2–10s |
+| Cost | ~$0.001/call | ~$0 | $0.01–0.10/call |
+| Handles semantic variants | ✅ Yes | ❌ No | ✅ Yes |
+| Training data needed | 20 examples/bucket | 200+ labeled | None |
+| Consistent with vector DB | ✅ Same embedding model | ❌ Different space | ❌ |
+
+**Decision: Embedding + cosine similarity for v1. Uses the same embedding model (text-embedding-004) as the vector DB — same semantic space for both classification and similarity search, no impedance mismatch.**
+
+### Classifier stack
+
+```
+v0  Regex rules                    →  bucket  (day 1, zero data)
+v1  Embedding + cosine to centroids →  bucket + similarity score  (~150 labeled examples)
+v2  XGBoost on bool regex features  →  optional ensemble with v1 (uses FEATURE_SCHEMA flags,
+                                        not TF-IDF — hand-crafted signal, not raw word counts)
+LLM Gemini (flash for known patterns, pro for complex)
+                                   →  only when v0/v1 confidence < 0.85
+```
 
 ### Feature Extraction from Logs
 
@@ -681,51 +703,156 @@ Effective rule:
   For auto-retry:      confidence = min(P_classifier, P_success_rate)  [P_vector not applicable]
 
 Where:
-  P_classifier   = XGBoost (or regex-rules) probability for predicted bucket   [0.0 – 1.0]
-  P_vector       = cosine similarity to best matching past incident             [0.0 – 1.0]
-                   (= 0.50 if no past incident — cold start penalty)
+  P_classifier   = embedding/regex classifier probability for predicted bucket  [0.0 – 1.0]
+  P_vector       = P_vector_raw × label_agreement × resolution_agreement       [0.0 – 1.0]
+                   (see breakdown below — similarity alone is not enough)
   P_success_rate = historical success rate of this fix type                    [0.0 – 1.0]
                    (= 0.65 default if < 3 past incidents of this type)
 
 Thresholds:
-  confidence ≥ 0.90 AND all gates pass  → create PR  (or execute auto-retry)
+  confidence ≥ 0.90 AND all gates pass  → execute / create PR
   0.70 ≤ confidence < 0.90              → advisory alert only, no execution
-  confidence < 0.70                     → ops escalate
+  confidence < 0.70                     → route to Gemini for disambiguation
 ```
 
-```python
-def compute_confidence(plan, unit_result=None, integration_result=None,
-                       snyk_result=None, secret_result=None) -> float:
-    # Probabilistic signals — min(), not product
-    p_signals = [plan.classifier_confidence, plan.historical_success_rate]
-    if plan.vector_similarity is not None:
-        p_signals.append(plan.vector_similarity)
+---
 
+### P_vector is not just similarity — it has two guards
+
+**The problem:** High embedding similarity ≠ same failure bucket ≠ same remediation.
+
+Example — 3 retrieved incidents for a new failure:
+
+| Retrieved | Similarity | Bucket | Resolution type |
+|-----------|-----------|--------|----------------|
+| Incident A | 0.88 | R2 dependency | pip install fix |
+| Incident B | 0.84 | R2 dependency | JAR classpath fix |
+| Incident C | 0.79 | R1 resource | memory scale-up |
+
+Two incidents agree on bucket (R2), one disagrees. Two R2 incidents disagree on *how* to fix it. Raw similarity average = 0.837 — looks confident. But auto-routing to R2 with either fix risks applying the wrong remediation.
+
+**Guard 1 — Label agreement penalty:**
+
+Mixed bucket retrievals mean the embedding space doesn't cleanly separate these failure types here. Penalize P_vector proportionally:
+
+```
+label_agreement = (count of retrievals matching top bucket) / (total retrievals)
+                = 2 / 3 = 0.667
+
+P_vector_raw = weighted_bucket_vote
+             = (0.88 + 0.84) / (0.88 + 0.84 + 0.79)
+             = 1.72 / 2.51
+             = 0.685
+
+After label agreement:
+P_vector = 0.685 × 0.667 = 0.457
+```
+
+**Guard 2 — Remediation path divergence check:**
+
+Even when all retrieved incidents agree on the bucket, they may disagree on the fix type. Applying the wrong fix within the right bucket is still wrong — a pip install for a JAR issue doesn't help.
+
+```
+resolution_agreement = all same-bucket retrievals share the same resolution type?
+  All agree (all code PR, same fix type) → 1.0  (no penalty)
+  Partial agreement (2/3 same type)      → 0.75
+  No agreement (all different fix types) → 0.5
+
+P_vector = P_vector × resolution_agreement
+```
+
+In the example: Incident A (pip install) ≠ Incident B (JAR classpath) → partial agreement → 0.75 multiplier:
+```
+P_vector = 0.457 × 0.75 = 0.343
+```
+
+**Final confidence for the example:**
+```
+confidence = min(P_classifier=0.88, P_vector=0.343, P_success_rate=0.80)
+           = 0.343   →  below 0.70  →  route to Gemini for disambiguation
+```
+
+Gemini receives: the error extract + all 3 retrieved incidents + their respective resolutions.
+Prompt: *"Three past incidents are semantically similar but disagree on bucket and fix type. Determine which this failure is and why."*
+Gemini resolves the ambiguity — LLM is used precisely where it adds value, not by default.
+
+---
+
+### What prevents semantic similarity from causing wrong routing
+
+```
+Embedding retrieval        →  surfaces candidates (doesn't decide routing)
+Label agreement penalty    →  degrades P_vector when buckets disagree
+Resolution divergence check →  degrades P_vector when fix types disagree within same bucket
+min() formula              →  any degraded signal pulls confidence down
+0.90 gate                  →  mixed retrievals naturally fall below it → no auto-execution
+Gemini disambiguation      →  fires only when confidence < 0.70 (ambiguous cases)
+```
+
+The embedding layer does not need to be perfect. It needs to surface good candidates. The confidence scoring ensures ambiguous retrievals never auto-execute.
+
+---
+
+```python
+def compute_p_vector(retrieved: List[RetrievedIncident]) -> float:
+    if not retrieved:
+        return 0.50   # cold start penalty
+
+    # Step 1: weighted bucket vote
+    bucket_weights = defaultdict(float)
+    for r in retrieved:
+        bucket_weights[r.bucket] += r.similarity
+
+    total_weight = sum(bucket_weights.values())
+    top_bucket = max(bucket_weights, key=bucket_weights.get)
+    p_vector_raw = bucket_weights[top_bucket] / total_weight
+
+    # Guard 1: label agreement penalty
+    label_agreement = sum(1 for r in retrieved if r.bucket == top_bucket) / len(retrieved)
+    p_vector = p_vector_raw * label_agreement
+
+    # Guard 2: remediation path divergence check (within top-bucket incidents only)
+    top_bucket_incidents = [r for r in retrieved if r.bucket == top_bucket]
+    resolution_types = set(r.resolution_type for r in top_bucket_incidents)
+    if len(resolution_types) == 1:
+        resolution_agreement = 1.0
+    elif len(resolution_types) == len(top_bucket_incidents):
+        resolution_agreement = 0.5    # all different
+    else:
+        resolution_agreement = 0.75   # partial
+
+    return p_vector * resolution_agreement
+
+
+def compute_confidence(plan, retrieved, unit_result=None,
+                       snyk_result=None, secret_result=None) -> float:
+    p_vector = compute_p_vector(retrieved)
+    p_signals = [plan.classifier_confidence, p_vector, plan.historical_success_rate]
     confidence = min(p_signals)
 
     # Hard boolean gates — veto any execution
     if unit_result and not unit_result.passed:
-        return 0.0   # Tests failed — never PR
+        return 0.0
     if snyk_result and not snyk_result.passed:
-        return 0.0   # Security issue — never PR
+        return 0.0
     if secret_result and secret_result.has_secrets:
-        return 0.0   # Credentials in generated code — never PR
+        return 0.0
 
     return confidence
 ```
 
-### Corrected example calculations
+### Example calculations
 
-| Scenario | P_cls | P_vec | P_success | min() | Gates | **Score** | Action |
-|----------|-------|-------|-----------|-------|-------|-----------|--------|
-| Known OOM, seen 20× before, retry works | 0.97 | 0.95 | 0.92 | **0.92** | N/A (retry) | **0.92** | ✅ Auto-retry |
-| Package mismatch, similar fix, tests pass | 0.91 | 0.88 | 0.85 | **0.85** | All pass | **0.85** | Advisory only |
-| Novel code bug, LLM proposes fix, tests pass | 0.78 | 0.55 | 0.70 | **0.55** | All pass | **0.55** | Ops escalate |
-| Known schema fix, Snyk finds CVE | 0.95 | 0.91 | 0.90 | 0.90 | Snyk=FAIL | **0.0** | Blocked — Snyk |
-| Cold start (no vector history) | 0.91 | 0.50 | 0.65 | **0.50** | All pass | **0.50** | Ops escalate |
+| Scenario | P_cls | P_vec (after guards) | P_success | min() | Gates | **Score** | Action |
+|----------|-------|---------------------|-----------|-------|-------|-----------|--------|
+| Known OOM, 20× before, all agree on retry | 0.97 | 0.92 | 0.92 | **0.92** | N/A | **0.92** | ✅ Auto-retry |
+| 3 retrievals: 2×R2 + 1×R1 (example above) | 0.88 | 0.34 | 0.80 | **0.34** | — | **0.34** | Gemini disambiguates |
+| 3×R2 retrieved but 2 different fix types | 0.91 | 0.51 | 0.85 | **0.51** | — | **0.51** | Gemini disambiguates |
+| 3×R2 retrieved, all same fix, tests pass | 0.91 | 0.87 | 0.85 | **0.85** | All pass | **0.85** | Advisory only |
+| Cold start, no history | 0.91 | 0.50 | 0.65 | **0.50** | — | **0.50** | Gemini / ops |
+| Known schema fix, Snyk blocks | 0.95 | 0.91 | 0.90 | 0.90 | Snyk=FAIL | **0.0** | Blocked |
 
-> **Calibration:** Use isotonic regression on XGBoost output probabilities to get calibrated scores.
-> Start all thresholds in shadow mode — measure proposed-vs-actual accuracy for 30 days before
+> **Calibration:** Start all thresholds in shadow mode — measure proposed-vs-actual accuracy for 30 days before
 > enabling execution. Re-evaluate thresholds quarterly against labeled outcomes in vector DB.
 
 ---
